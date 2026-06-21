@@ -271,3 +271,178 @@ def test_core_does_not_depend_on_git_at_module_level():
 def test_doctor_reports_healthy(repo):
     run(["init", "--email", "j@e.com"])
     assert run(["doctor"]) == 0
+
+
+# ----------------------------------------------------- line-level diff3 (unit)
+
+def _lines(s):
+    return s.splitlines(keepends=True)
+
+
+def test_diff3_disjoint_auto_merges():
+    from checkpoint_core.merge import diff3, render
+    base = _lines("a\nb\nc\nd\ne\n")
+    ours = _lines("A\nb\nc\nd\ne\n")       # changed line 1
+    theirs = _lines("a\nb\nc\nd\nE\n")     # changed line 5 (disjoint)
+    has_conflict, content = render(diff3(base, ours, theirs))
+    assert not has_conflict
+    assert content == "A\nb\nc\nd\nE\n"
+
+
+def test_diff3_overlapping_conflicts():
+    from checkpoint_core.merge import diff3, render
+    base = _lines("a\nb\nc\n")
+    ours = _lines("a\nB1\nc\n")
+    theirs = _lines("a\nB2\nc\n")
+    has_conflict, content = render(diff3(base, ours, theirs))
+    assert has_conflict
+    assert "<<<<<<< ours" in content and ">>>>>>> theirs" in content
+    assert content.startswith("a\n") and content.rstrip().endswith("c")
+
+
+def test_diff3_same_change_both_sides_no_conflict():
+    from checkpoint_core.merge import diff3, render
+    base = _lines("a\nb\nc\n")
+    ours = theirs = _lines("a\nX\nc\n")
+    has_conflict, content = render(diff3(base, ours, theirs))
+    assert not has_conflict
+    assert content == "a\nX\nc\n"
+
+
+# ------------------------------------------------------- line-level merge (e2e)
+
+def _accept_on(repo, branch, fname, content, msg):
+    run(["checkout", branch])
+    (repo / fname).write_text(content)
+    run(["start", msg]); assert run(["accept", "--no-verify", "-m", msg]) == 0
+
+
+def test_merge_disjoint_same_file_auto_merges(repo):
+    run(["init", "--email", "j@e.com"])
+    (repo / "code.txt").write_text("l1\nl2\nl3\nl4\nl5\n")
+    run(["start", "base"]); run(["accept", "--no-verify", "-m", "base"])
+    run(["branch", "dev"])
+    _accept_on(repo, "dev", "code.txt", "TOP\nl2\nl3\nl4\nl5\n", "edit top")
+    _accept_on(repo, "main", "code.txt", "l1\nl2\nl3\nl4\nBOTTOM\n", "edit bottom")
+    assert run(["merge", "dev"]) == 0   # auto-merge, no conflict
+    assert (repo / "code.txt").read_text() == "TOP\nl2\nl3\nl4\nBOTTOM\n"
+    assert run(["verify-history"]) == 0  # merge snapshot is sealed and valid
+
+
+def test_merge_overlapping_same_file_conflicts(repo):
+    run(["init", "--email", "j@e.com"])
+    (repo / "x.txt").write_text("alpha\nbeta\ngamma\n")
+    run(["start", "base"]); run(["accept", "--no-verify", "-m", "base"])
+    run(["branch", "b2"])
+    _accept_on(repo, "b2", "x.txt", "alpha\nBETA-theirs\ngamma\n", "t")
+    _accept_on(repo, "main", "x.txt", "alpha\nBETA-ours\ngamma\n", "o")
+    assert run(["merge", "b2"]) == 1
+    content = (repo / "x.txt").read_text()
+    assert "<<<<<<< ours" in content and ">>>>>>> theirs" in content
+    # surrounding stable lines preserved (only the beta hunk conflicts)
+    assert content.startswith("alpha\n") and content.rstrip().endswith("gamma")
+
+
+def test_merge_delete_modify_conflicts(repo):
+    run(["init", "--email", "j@e.com"])
+    (repo / "d.txt").write_text("keep\nme\n")
+    run(["start", "base"]); run(["accept", "--no-verify", "-m", "base"])
+    run(["branch", "mod"])
+    _accept_on(repo, "mod", "d.txt", "keep\nMODIFIED\n", "modify")
+    # main deletes the file
+    run(["checkout", "main"])
+    (repo / "d.txt").unlink()
+    run(["start", "delete"]); run(["accept", "--no-verify", "-m", "delete"])
+    assert run(["merge", "mod"]) == 1   # delete/modify conflict
+
+
+def test_merge_binary_conflict(repo):
+    run(["init", "--email", "j@e.com"])
+    (repo / "b.bin").write_bytes(b"\x00\x01\x02base\x00")
+    run(["start", "base"]); run(["accept", "--no-verify", "-m", "base"])
+    run(["branch", "bb"])
+    run(["checkout", "bb"])
+    (repo / "b.bin").write_bytes(b"\x00\x01\x02theirs\xff")
+    run(["start", "t"]); run(["accept", "--no-verify", "-m", "t"])
+    run(["checkout", "main"])
+    (repo / "b.bin").write_bytes(b"\x00\x01\x02ours\xfe")
+    run(["start", "o"]); run(["accept", "--no-verify", "-m", "o"])
+    assert run(["merge", "bb"]) == 1   # binary changed both sides -> conflict
+
+
+# ----------------------------------------------------------- git bridge round-trip
+
+import shutil  # noqa: E402
+
+git_required = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+
+
+@git_required
+def test_git_import_strips_trailers_and_keeps_clean_message(tmp_path, monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    a = tmp_path / "a"; a.mkdir()
+    monkeypatch.chdir(a); run(["init", "--name", "Jack", "--email", "jack@e.com"])
+    (a / "f.txt").write_text("v1\n")
+    run(["start", "fix camera exposure"]); run(["accept", "--no-verify", "-m", "fix camera exposure"])
+    gdir = tmp_path / "g"
+    run(["git-export", str(gdir)])
+    # import into a fresh core repo
+    b = tmp_path / "b"; b.mkdir()
+    monkeypatch.chdir(b); run(["init", "--email", "b@e.com"])
+    run(["git-import", str(gdir)])
+    from checkpoint_core.store import Repo
+    from checkpoint_core import objects
+    snap = Repo(b).get_object(Repo(b).head_snapshot())
+    assert snap["message"] == "fix camera exposure"          # clean, no trailers
+    assert "Checkpoint-" not in snap["message"]
+    assert snap["bridge"]["source"] == "git-import"          # provenance as metadata
+    assert "git_commit" in snap["bridge"]
+    assert objects.verify_seal(snap)
+
+
+@git_required
+def test_git_roundtrip_does_not_compound_trailers(tmp_path, monkeypatch):
+    import subprocess
+    monkeypatch.setenv("NO_COLOR", "1")
+    a = tmp_path / "a"; a.mkdir()
+    monkeypatch.chdir(a); run(["init", "--email", "jack@e.com"])
+    (a / "f.txt").write_text("v1\n")
+    run(["start", "do a thing"]); run(["accept", "--no-verify", "-m", "do a thing"])
+
+    def export_import_export(src_core, label):
+        gdir = tmp_path / ("g_" + label)
+        monkeypatch.chdir(src_core); run(["git-export", str(gdir)])
+        return gdir
+
+    g1 = export_import_export(a, "1")
+    # round-trip: g1 -> core b -> g2
+    b = tmp_path / "b"; b.mkdir()
+    monkeypatch.chdir(b); run(["init", "--email", "b@e.com"]); run(["git-import", str(g1)])
+    g2 = tmp_path / "g2"
+    monkeypatch.chdir(b); run(["git-export", str(g2)])
+
+    def session_trailer_count(gdir):
+        body = subprocess.run(["git", "-C", str(gdir), "log", "-1", "--format=%B"],
+                              capture_output=True, text=True).stdout
+        return body.count("Checkpoint-Session:")
+
+    assert session_trailer_count(g1) == 1
+    assert session_trailer_count(g2) == 1   # did NOT compound to 2
+    # and the human message stayed clean through the round-trip
+    body2 = subprocess.run(["git", "-C", str(g2), "log", "-1", "--format=%s"],
+                           capture_output=True, text=True).stdout.strip()
+    assert body2 == "do a thing"
+
+
+@git_required
+def test_git_roundtrip_preserves_file_content(tmp_path, monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    a = tmp_path / "a"; a.mkdir()
+    monkeypatch.chdir(a); run(["init", "--email", "jack@e.com"])
+    (a / "f.txt").write_text("hello world\n")
+    run(["start", "c1"]); run(["accept", "--no-verify", "-m", "c1"])
+    gdir = tmp_path / "g"; run(["git-export", str(gdir)])
+    b = tmp_path / "b"; b.mkdir()
+    monkeypatch.chdir(b); run(["init", "--email", "b@e.com"])
+    run(["git-import", str(gdir)]); run(["checkout", "main"])
+    assert (b / "f.txt").read_text() == "hello world\n"

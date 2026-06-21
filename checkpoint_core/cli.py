@@ -631,8 +631,11 @@ def cmd_merge(args) -> int:
     oid = repo.put_object(snap)
     repo.update_ref("refs/heads/{}".format(branch), oid)
     ledgermod.append(repo, "merge", None, repo.identity(),
-                     {"into": branch, "from": args.name, "type": "three-way", "head": oid})
+                     {"into": branch, "from": args.name, "type": "three-way",
+                      "head": oid, "auto_merged": len(result["auto_merged"])})
     info(util.green("Merged ") + "{} into {} ({})".format(args.name, branch, _short(oid)))
+    if result["auto_merged"]:
+        info("  auto-merged (line-level): {}".format(", ".join(result["auto_merged"])))
     return 0
 
 

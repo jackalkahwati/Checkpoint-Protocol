@@ -7,13 +7,35 @@ Git on demand.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import objects, util
 from .session import Session, ACCEPTED
 from .store import Repo
+
+# Trailer keys the bridge owns. These are bridge metadata, never Checkpoint history text.
+_CKPT_TRAILER = re.compile(r"^Checkpoint-([A-Za-z][A-Za-z0-9-]*):\s*(.*)$")
+
+
+def _strip_checkpoint_trailers(message: str) -> Tuple[str, Dict[str, List[str]]]:
+    """Remove all Checkpoint-* trailer lines from a commit message.
+
+    Returns (clean_message, found) where `found` maps trailer key -> list of values
+    (a list so legacy *compounded* trailers are captured, not lost).
+    """
+    kept: List[str] = []
+    found: Dict[str, List[str]] = {}
+    for line in message.splitlines():
+        m = _CKPT_TRAILER.match(line.strip())
+        if m:
+            found.setdefault(m.group(1), []).append(m.group(2).strip())
+            continue
+        kept.append(line)
+    clean = "\n".join(kept).rstrip()
+    return clean, found
 
 
 def _git(cwd: Path, args: List[str], env: Optional[Dict[str, str]] = None,
@@ -74,10 +96,16 @@ def export_to_git(repo: Repo, dest_dir: Path, branch: Optional[str] = None) -> D
             "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email,
             "GIT_AUTHOR_DATE": ts, "GIT_COMMITTER_DATE": ts,
         }
-        msg = (snap.get("message") or "checkpoint snapshot")
-        trailer = "\n\nCheckpoint-Session: {}\nCheckpoint-Snapshot: {}".format(
-            snap.get("session"), oid)
-        _git(dest, ["commit", "-q", "--allow-empty", "-m", msg + trailer], env=env)
+        # The snapshot message is already clean (our accepts and git-import both keep
+        # it clean), so build exactly ONE trailer block from the snapshot's own fields.
+        # Defensive: strip any stray Checkpoint-* trailers so they can never compound.
+        msg, _ = _strip_checkpoint_trailers(snap.get("message") or "checkpoint snapshot")
+        trailer_lines = []
+        if snap.get("session"):
+            trailer_lines.append("Checkpoint-Session: {}".format(snap["session"]))
+        trailer_lines.append("Checkpoint-Snapshot: {}".format(oid))
+        full = msg.rstrip() + "\n\n" + "\n".join(trailer_lines)
+        _git(dest, ["commit", "-q", "--allow-empty", "-m", full], env=env)
         count += 1
     return {"dest": str(dest), "commits": count, "head": head}
 
@@ -104,11 +132,19 @@ def import_from_git(repo: Repo, git_dir: Path, branch: Optional[str] = None) -> 
     for commit in commits:
         tree_id = _import_commit_tree(repo, src, commit)
         meta = _commit_meta(src, commit)
+        # Keep the human commit message clean; capture any Checkpoint-* trailers as
+        # bridge metadata so repeated round-trips never pollute Checkpoint history.
+        clean_message, trailers = _strip_checkpoint_trailers(meta["message"])
+        bridge: Dict[str, Any] = {"source": "git-import", "git_commit": commit}
+        if trailers:
+            bridge["original_trailers"] = trailers
+            if trailers.get("Session"):
+                bridge["origin_session"] = trailers["Session"][-1]
         snap = objects.make_snapshot(
             tree=tree_id, parents=[parent] if parent else [], session=isess.id,
-            kind=objects.KIND_ACCEPTED, message=meta["message"],
+            kind=objects.KIND_ACCEPTED, message=clean_message,
             author={"id": meta["email"], "name": meta["name"], "email": meta["email"]},
-            timestamp=meta["date"],
+            timestamp=meta["date"], bridge=bridge,
         )
         snap = objects.sign(snap, meta["email"])
         oid = repo.put_object(snap)

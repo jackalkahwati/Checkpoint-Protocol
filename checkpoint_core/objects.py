@@ -40,6 +40,7 @@ def make_snapshot(
     timestamp: str,
     verification: Optional[str] = None,
     signature: Optional[Dict[str, str]] = None,
+    bridge: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     snap: Dict[str, Any] = {
         "type": "snapshot",
@@ -52,6 +53,10 @@ def make_snapshot(
         "timestamp": timestamp,
         "verification": verification,
     }
+    if bridge is not None:
+        # Bridge provenance (e.g. git import/export). Metadata only; NOT user-facing
+        # history text and intentionally excluded from the content seal.
+        snap["bridge"] = bridge
     if signature is not None:
         snap["signature"] = signature
     return snap

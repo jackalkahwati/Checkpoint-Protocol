@@ -155,7 +155,7 @@ checkpoint-core git-import ./legacy-repo # import a Git repo; Checkpoint becomes
 | `log [--status]` | Session history (active/accepted/rejected/rolled_back). |
 | `history` | Accepted-snapshot history — the commit-log equivalent. |
 | `show <session-id>` | Full session detail: snapshots, verification, ledger. |
-| `branch [<name>]` / `checkout <name>` / `merge <name>` | Native branching and file-level three-way merge with conflict markers. |
+| `branch [<name>]` / `checkout <name>` / `merge <name>` | Native branching and line-level (diff3) three-way merge: disjoint edits auto-merge, overlapping edits conflict. |
 | `remote add <name> --location <dir>` / `push` / `pull` | Content-addressed sync between stores (server-free). |
 | `bundle export\|import` | Portable `.tar.gz` transport for offline sync. |
 | `git-export <dir>` / `git-import <dir>` | The Git bridge (the only Git-touching code). |
@@ -171,7 +171,8 @@ checkpoint-core git-import ./legacy-repo # import a Git repo; Checkpoint becomes
   its canonical JSON.
 - **Snapshot** — a tree + provenance: `parents`, the producing `session`, `kind`
   (`accepted` / `snapshot` / `autosave`), message, author, verification ref, and a
-  **SHA-256 content seal**.
+  **SHA-256 content seal**. Merges and Git-bridge provenance attach as metadata without
+  affecting the seal.
 - **Session** — the central object: instruction, actor/agent, base, intermediate
   snapshots, verification runs, and the accept/reject result.
 - **Refs / HEAD** — `refs/heads/<branch>` points at an accepted snapshot; history is the

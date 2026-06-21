@@ -239,18 +239,27 @@ Checkpoint does not depend on `git diff`. Diffs are computed natively:
 - **branch `<name>`** creates `refs/heads/<name>` at the current head.
 - **checkout `<name>`** materializes the branch head's tree into the working directory and
   attaches HEAD.
-- **merge `<name>`** performs a **file-level three-way merge** between the current head
-  (`ours`), the named branch head (`theirs`), and their **merge base** (lowest common
-  ancestor in the accepted-snapshot DAG):
-  - file changed on only one side → take that side;
-  - both sides identical → take it;
-  - both sides changed differently → **conflict**: the file is written with standard
-    conflict markers (`<<<<<<< ours` / `=======` / `>>>>>>> theirs`) and the merge is
-    reported as conflicted (no merge snapshot is created until resolved).
-  - A clean merge creates an accepted snapshot with `parents=[ours, theirs]`.
+- **merge `<name>`** performs a **line-level three-way (diff3) merge** between the current
+  head (`ours`), the named branch head (`theirs`), and their **merge base** (lowest common
+  ancestor in the accepted-snapshot DAG). Per path:
+  - changed on only one side → take that side;
+  - both sides identical, or both made the same change → take it;
+  - both sides changed the same **text** file → run **diff3**:
+    - **disjoint** line regions → **auto-merge** (no conflict); the merged content becomes
+      a new blob in the merged tree;
+    - **overlapping** line regions → **conflict** only around the overlapping hunk, written
+      with standard markers (`<<<<<<< ours` / `=======` / `>>>>>>> theirs`); surrounding
+      unchanged lines are preserved;
+  - **binary** file changed on both sides → conflict (cannot line-merge);
+  - one side **deletes** while the other **modifies** → conflict.
+  - A clean merge (including auto-merged files) creates an accepted snapshot with
+    `parents=[ours, theirs]`. If any path conflicts, conflicted files are written to the
+    working tree with markers and **no** merge snapshot is created until resolved (resolve,
+    then `start` + `accept` records the merge).
 
-  Line-level (diff3) merging is a documented future upgrade; file-level is the MVP
-  contract.
+  diff3 synchronizes on lines common to all three versions (base ∩ ours ∩ theirs) and
+  classifies the regions between those anchors. Semantic / AST-aware merge and rename
+  detection are intentionally out of scope for this version.
 
 ---
 
@@ -305,9 +314,35 @@ The bridge is the **only** component that touches Git. Core never imports Git.
   mirrors Checkpoint history. Session/prompt/verification provenance is preserved in the
   Git commit trailer/notes (best-effort) but lives canonically in Checkpoint.
 - **git-import**: walk a Git repository's commits and create accepted snapshots
-  (`kind: "accepted"`) with matching trees, messages, authors, and parent links, plus a
-  synthetic import session per commit. After import, the Checkpoint store is the source of
-  truth and Git is no longer required.
+  (`kind: "accepted"`) with matching trees, **cleaned** messages, authors, and parent
+  links, plus a synthetic import session. After import, the Checkpoint store is the source
+  of truth and Git is no longer required.
+
+### Trailer discipline (bridge metadata is not history)
+
+Git trailers are **bridge metadata**, never Checkpoint history text. The bridge enforces:
+
+- **On export**, the commit message is the snapshot's clean message plus exactly **one**
+  trailer block built from the snapshot's own fields:
+  `Checkpoint-Session: <id>` and `Checkpoint-Snapshot: <sha>`. Any stray `Checkpoint-*`
+  lines already in the message are stripped first, so trailers can never accumulate.
+- **On import**, all `Checkpoint-*` trailer lines are stripped from the commit message.
+  The snapshot's `message` is the clean human text; the stripped values and the source
+  Git commit are recorded under the snapshot's optional `bridge` field, e.g.:
+
+  ```json
+  "bridge": {
+    "source": "git-import",
+    "git_commit": "<sha1>",
+    "origin_session": "cs_...",
+    "original_trailers": { "Session": ["cs_..."], "Snapshot": ["<sha256>"] }
+  }
+  ```
+
+  The `bridge` field is **excluded from the content seal** (§6), so provenance never
+  affects snapshot identity or seal validity.
+- **Idempotency**: `core → git → core → git → …` neither compounds trailers nor mutates
+  the human message. Repeated round-trips are stable.
 
 Round-trip identity is preserved at the tree level (file contents are byte-identical);
 commit/snapshot ids differ because the object formats differ by design.
