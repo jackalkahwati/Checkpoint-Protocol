@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Standalone launcher so `checkpoint` works without installation.
+
+Add this directory to PATH, or symlink this file onto your PATH:
+    ln -s "$(pwd)/bin/checkpoint" /usr/local/bin/checkpoint
+"""
+import os
+import sys
+
+# Make the package importable when run directly from the repo.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from checkpoint.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

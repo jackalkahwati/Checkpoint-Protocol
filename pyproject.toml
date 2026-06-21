@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "checkpoint-protocol"
+version = "0.1.0"
+description = "Local-first, Git-compatible, AI-native change-control layer for AI-assisted development."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Checkpoint Protocol" }]
+dependencies = [
+  "PyYAML>=5.4",
+]
+
+[project.scripts]
+checkpoint = "checkpoint.cli:main"
+
+[tool.setuptools]
+packages = ["checkpoint"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
