@@ -1,8 +1,13 @@
-# Checkpoint Protocol Specification
+# Checkpoint Git-Adapter Specification
 
 Version: 0.1 (MVP)
 Status: Draft
 Local metadata directory: `.checkpoint`
+
+> **This document specifies the Git ADAPTER**, the adoption wedge that layers on top of an
+> existing Git repository (here, Git is the source of truth). It is **not** the main
+> protocol. The source-of-truth, Git-replacement protocol is **Checkpoint Core**, specified
+> in [`checkpoint-core-protocol.md`](checkpoint-core-protocol.md). Read that first.
 
 ---
 

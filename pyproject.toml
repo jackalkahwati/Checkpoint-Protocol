@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "checkpoint-protocol"
 version = "0.1.0"
-description = "Local-first, Git-compatible, AI-native change-control layer for AI-assisted development."
+description = "Checkpoint Core: a Git-replacement version-control protocol for human + AI code, with a Git import/export bridge and a Git-adapter wedge."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -15,10 +15,11 @@ dependencies = [
 ]
 
 [project.scripts]
+checkpoint-core = "checkpoint_core.cli:main"
 checkpoint = "checkpoint.cli:main"
 
 [tool.setuptools]
-packages = ["checkpoint"]
+packages = ["checkpoint_core", "checkpoint"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
