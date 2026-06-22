@@ -64,19 +64,36 @@ def _last_verification(repo: Repo, sess: Dict[str, Any]) -> Optional[Dict[str, A
     return util.read_json(repo.paths.session_dir(sess["session_id"]) / "verification" / (runs[-1] + ".json"), None)
 
 
-def _session_policy_effect(repo: Repo, sess: Dict[str, Any]) -> str:
-    pol = policymod.load(repo)
-    if pol is None:
-        return "allow"
+def _session_policy_input(repo: Repo, sess: Dict[str, Any]) -> Dict[str, Any]:
+    """A faithful PolicyInput for a session: real changed paths, verification results,
+    signature state, and acceptor trust — so the decision reflects what actually happened."""
     from .. import util
     pkt = util.read_json(repo.paths.session_dir(sess["session_id"]) / "packet.json", None)
     changed = [f["path"] for f in (pkt.get("changed_files", []) if pkt else [])]
     actor = sess.get("actor", {}) or {}
-    decision = policymod.evaluate(pol, {
+    accepted = (sess.get("result") or {}).get("snapshot")
+    sigs = signmod.signatures_for(repo, accepted) if accepted else []
+    signed = bool(sigs)
+    trusted = False
+    for s in sigs:
+        idr = idmod.load(repo, s.get("signer_identity_id"))
+        if idr and idr.get("trusted") and not idr.get("revoked"):
+            trusted = True
+    ver = _last_verification(repo, sess)
+    passed = [r.get("name") for r in (ver.get("results", []) if ver else []) if r.get("status") == "passed"]
+    return {
         "operation": "accept", "actor_type": actor.get("type", "human"),
         "branch": (sess.get("base", {}) or {}).get("branch"), "changed_paths": changed,
-    })
-    return decision["effect"]
+        "verification_passed": passed, "will_sign": signed,
+        "trust_status": "trusted" if trusted else "untrusted",
+    }
+
+
+def _session_policy_effect(repo: Repo, sess: Dict[str, Any]) -> str:
+    pol = policymod.load(repo)
+    if pol is None:
+        return "allow"
+    return policymod.evaluate(pol, _session_policy_input(repo, sess))["effect"]
 
 
 def _ui_session(repo: Repo, sess: Dict[str, Any]) -> Dict[str, Any]:
@@ -147,6 +164,8 @@ def _ui_diff_files(repo: Repo, base_tree: Optional[str], cur_tree: Optional[str]
     files = []
 
     def build(old_blob, new_blob, old_path, new_path, change_type, similarity=None):
+        if similarity is not None and similarity <= 1:   # frontend expects a 0..100 percentage
+            similarity = round(similarity * 100)
         ol, nl = _decode(repo, old_blob), _decode(repo, new_blob)
         if ol is None or nl is None:
             return {"old_path": old_path, "new_path": new_path, "change_type": "binary",
@@ -344,19 +363,14 @@ def ui_session_policy(ctx):
     repo, err, o, n = _repo(ctx)
     if err:
         return err
-    from .. import util
     sess = _load_session(repo, ctx.params[2])
     if not sess:
         return 404, {"error": "no such session"}
     pol = policymod.load(repo)
     if pol is None:
         return 200, None
-    pkt = util.read_json(repo.paths.session_dir(ctx.params[2]) / "packet.json", None)
-    changed = [f["path"] for f in (pkt.get("changed_files", []) if pkt else [])]
-    actor = sess.get("actor", {}) or {}
-    d = policymod.evaluate(pol, {"operation": "accept", "actor_type": actor.get("type", "human"),
-                                "branch": (sess.get("base", {}) or {}).get("branch"),
-                                "changed_paths": changed})
+    # use the faithful input (real verification results, signature, acceptor trust)
+    d = policymod.evaluate(pol, _session_policy_input(repo, sess))
     return 200, _ui_decision(d)
 
 

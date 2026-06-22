@@ -129,7 +129,10 @@ def test_ui_session_diff_has_hunks_and_renames(server, tmp_path):
     for k in ("old_path", "new_path", "change_type", "additions", "deletions", "hunks"):
         assert k in f
     # a 20-line file with one changed line -> detected as a rename with hunks
-    assert any(d["change_type"] == "renamed" and d.get("similarity") for d in diff)
+    rn = [d for d in diff if d["change_type"] == "renamed" and d.get("similarity")]
+    assert rn
+    # similarity is a 0..100 percentage (the frontend renders `{similarity}%`), not a 0..1 fraction
+    assert rn[0]["similarity"] > 1 and rn[0]["similarity"] <= 100
 
 
 def test_ui_session_packet_and_timeline(server, tmp_path):
@@ -200,6 +203,43 @@ def test_ui_verify_signatures_array(server, tmp_path):
     populate(server, tmp_path)
     st, sigs = ui(server, base(server) + "/signatures/verify", "POST", {})
     assert st == 200 and isinstance(sigs, list)
+
+
+def test_ui_session_policy_reflects_verification_and_signature(server, tmp_path):
+    """The per-session Policy Decision must use the session's REAL verification results,
+    signature state, and acceptor trust — not a bare input that falsely reports
+    'verification not passed' / 'signed accept required' for an accepted, signed, verified
+    session. (Regression for the Playwright-reviewed policy-panel bug.)"""
+    import yaml
+    from checkpoint_core import policy as P
+    http("POST", server["url"] + "/repos", server["admin"], {"owner": "v", "repo": "r"})
+    work = tmp_path / "w2"; work.mkdir()
+    cwd = os.getcwd(); os.chdir(work)
+    try:
+        run(["init"]); run(["identity", "create", "--name", "Jack", "--type", "human"])
+        cfg = work / ".checkpoint" / "config.yaml"
+        d = yaml.safe_load(cfg.read_text())
+        d.setdefault("verification", {})["commands"] = [
+            {"name": "tests", "run": "exit 0"}, {"name": "lint", "run": "exit 0"}]
+        cfg.write_text(yaml.safe_dump(d, sort_keys=False))
+        (work / "app.py").write_text("x = 1\n")
+        run(["start", "do work"]); run(["verify"]); run(["accept", "-m", "do work"])
+        run(["remote", "add", "origin", "{}/v/r".format(server["url"]), "--token", server["admin"]])
+        run(["push", "origin", "main"])
+    finally:
+        os.chdir(cwd)
+    # configure policy and trust the signer on the server
+    http("PUT", server["url"] + "/repos/v/r/policy", server["admin"], {"policy": P.DEFAULT_STARTER_POLICY})
+    ids = http("GET", server["url"] + "/repos/v/r/identities", server["admin"])[1]["identities"]
+    for i in ids:
+        http("POST", "{}/repos/v/r/identities/{}/trust".format(server["url"], i["identity_id"]), server["admin"])
+    sid = http("GET", server["url"] + "/ui/repos/v/r/sessions", server["admin"])[1][0]["session_id"]
+    st, dec = http("GET", "{}/ui/repos/v/r/sessions/{}/policy".format(server["url"], sid), server["admin"])
+    assert st == 200
+    joined = " ".join(dec["reasons"]).lower()
+    assert "verification" not in joined        # verification passed -> no such reason
+    assert "signed accept" not in joined       # the accept was signed -> no such reason
+    assert dec["effect"] == "allow"            # signed + verified + trusted -> allow
 
 
 def test_ui_requires_auth(server):
