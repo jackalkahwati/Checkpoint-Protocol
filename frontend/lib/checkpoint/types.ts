@@ -194,6 +194,48 @@ export interface HealthStatus {
   uptime_s: number
 }
 
+export type ReviewStatus = "open" | "merged" | "closed"
+
+export interface MRComment {
+  id: string
+  author: string
+  body: string
+  path?: string | null
+  line?: number | null
+  created_at: string
+  resolved: boolean
+}
+
+export interface MergeRequest {
+  id: string
+  title: string
+  description: string
+  author: string
+  status: ReviewStatus
+  source_snapshot: string
+  source_session?: string | null
+  target_branch: string
+  created_at: string
+  merged_at?: string | null
+  merged_snapshot?: string | null
+  comment_count: number
+  unresolved_count: number
+}
+
+export interface MergeRequestDetail extends MergeRequest {
+  comments: MRComment[]
+  diff: DiffFile[]
+  signatures: Signature[]
+  policy: PolicyDecision | null
+  mergeability: {
+    clean: boolean
+    conflicts: string[]
+    fast_forward: boolean
+    already_merged: boolean
+  }
+  mergeable: boolean
+}
+
 export interface SessionPacket {
   instruction: string
   summary: string

@@ -17,6 +17,7 @@ import {
   IntegrityTab,
   PolicyTab,
 } from "@/components/checkpoint/repo-tabs"
+import { ReviewsTab } from "@/components/checkpoint/reviews"
 import {
   IntegrityBadge,
   MockBadge,
@@ -79,6 +80,7 @@ export function RepoDetail({ owner, repo }: { owner: string; repo: string }) {
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList>
           <TabsTrigger value="sessions">Sessions</TabsTrigger>
+          <TabsTrigger value="reviews">Merge requests</TabsTrigger>
           <TabsTrigger value="branches">Branches</TabsTrigger>
           <TabsTrigger value="policy">Policy</TabsTrigger>
           <TabsTrigger value="identities">Identities</TabsTrigger>
@@ -91,6 +93,9 @@ export function RepoDetail({ owner, repo }: { owner: string; repo: string }) {
           ) : (
             <SessionTable sessions={sessionsQuery.data ?? []} owner={owner} repo={repo} />
           )}
+        </TabsContent>
+        <TabsContent value="reviews" className="mt-6">
+          <ReviewsTab owner={owner} repo={repo} />
         </TabsContent>
         <TabsContent value="branches" className="mt-6">
           <BranchesTab owner={owner} repo={repo} />

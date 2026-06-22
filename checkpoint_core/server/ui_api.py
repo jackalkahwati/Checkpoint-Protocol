@@ -10,9 +10,10 @@ import difflib
 import re as _re
 from typing import Any, Dict, List, Optional
 
-from .. import __version__, objects
+from .. import __version__, objects, util
 from .. import fsck as fsckmod, gc as gcmod, identity as idmod, ledger as ledgermod
 from .. import policy as policymod, reachable as R, sign as signmod
+from . import reviews as reviewsmod
 from ..diff import diff_result
 from ..store import Repo
 
@@ -569,9 +570,149 @@ def ui_audit(ctx):
     return 200, out
 
 
+# ----------------------------------------------------------------- merge requests
+
+def _author(ctx) -> str:
+    return (ctx.token or {}).get("name") or "reviewer"
+
+
+def _ui_review(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Frontend shape for a merge request (list/summary)."""
+    comments = rec.get("comments", [])
+    return {
+        "id": rec["id"], "title": rec["title"], "description": rec.get("description", ""),
+        "author": rec.get("author", "anon"), "status": rec["status"],
+        "source_snapshot": rec.get("source_snapshot"), "source_session": rec.get("source_session"),
+        "target_branch": rec.get("target_branch"), "created_at": rec.get("created_at", ""),
+        "merged_at": rec.get("merged_at"), "merged_snapshot": rec.get("merged_snapshot"),
+        "comment_count": len(comments),
+        "unresolved_count": sum(1 for c in comments if not c.get("resolved")),
+    }
+
+
+def ui_reviews_list(ctx):
+    repo, err, o, n = _repo(ctx)
+    if err:
+        return err
+    return 200, [_ui_review(r) for r in reviewsmod.list_reviews(ctx.store, o, n)]
+
+
+def ui_reviews_create(ctx):
+    repo, err, o, n = _repo(ctx)
+    if err:
+        return err
+    b = ctx.body or {}
+    target = b.get("target_branch") or "main"
+    source_snapshot = b.get("source_snapshot")
+    source_session = b.get("source_session")
+    # resolve a session to its accepted snapshot
+    if not source_snapshot and source_session:
+        sess = _load_session(repo, source_session)
+        source_snapshot = (sess.get("result") or {}).get("snapshot") if sess else None
+    if not source_snapshot:
+        return 400, {"error": "source_snapshot or an accepted source_session is required"}
+    if not repo.has_object(source_snapshot):
+        return 404, {"error": "source snapshot not found"}
+    rec = reviewsmod.create_review(
+        ctx.store, o, n, repo, title=b.get("title", ""), description=b.get("description", ""),
+        source_snapshot=source_snapshot, source_session=source_session,
+        target_branch=target, author=_author(ctx), now=util.now_iso())
+    return 201, _ui_review(rec)
+
+
+def ui_review_detail(ctx):
+    repo, err, o, n = _repo(ctx)
+    if err:
+        return err
+    rid = ctx.params[2]
+    rec = reviewsmod.get_review(ctx.store, o, n, rid)
+    if rec is None:
+        return 404, {"error": "no such merge request"}
+    out = _ui_review(rec)
+    out["comments"] = rec.get("comments", [])
+    # mergeability
+    m = reviewsmod.mergeability(repo, rec)
+    out["mergeability"] = {"clean": m["clean"], "conflicts": m.get("conflicts", []),
+                           "fast_forward": m.get("fast_forward", False),
+                           "already_merged": m.get("already_merged", False)}
+    # diff the MR would bring (target head -> source snapshot)
+    head = repo.read_ref("refs/heads/{}".format(rec["target_branch"]))
+    try:
+        src_tree = repo.get_object(rec["source_snapshot"])["tree"]
+        head_tree = repo.get_object(head)["tree"] if head and repo.has_object(head) else None
+        out["diff"] = _ui_diff_files(repo, head_tree, src_tree)
+    except Exception:
+        out["diff"] = []
+    # signature status of the source snapshot
+    out["signatures"] = _signatures_for_snap(repo, rec["source_snapshot"])
+    # policy preview for the merge
+    pol = policymod.load(repo)
+    if pol is None:
+        out["policy"] = None
+    else:
+        actor = "human"
+        if rec.get("source_session"):
+            sess = _load_session(repo, rec["source_session"])
+            if sess:
+                actor = (sess.get("actor", {}) or {}).get("type", "human")
+        d = policymod.evaluate(pol, {"operation": "merge", "actor_type": actor,
+                                     "branch": rec["target_branch"], "will_sign": True,
+                                     "trust_status": "trusted"})
+        out["policy"] = _ui_decision(d)
+    out["mergeable"] = bool(out["mergeability"]["clean"] and rec["status"] == "open"
+                            and (out["policy"] is None or out["policy"]["effect"] != "deny"))
+    return 200, out
+
+
+def ui_review_comment(ctx):
+    repo, err, o, n = _repo(ctx)
+    if err:
+        return err
+    b = ctx.body or {}
+    if not (b.get("body") or "").strip():
+        return 400, {"error": "comment body is required"}
+    c = reviewsmod.add_comment(ctx.store, o, n, ctx.params[2], author=_author(ctx),
+                               body=b["body"], path=b.get("path"), line=b.get("line"),
+                               now=util.now_iso())
+    return (201, c) if c else (404, {"error": "no such merge request"})
+
+
+def ui_review_comment_resolve(ctx):
+    repo, err, o, n = _repo(ctx)
+    if err:
+        return err
+    resolved = (ctx.body or {}).get("resolved", True)
+    c = reviewsmod.resolve_comment(ctx.store, o, n, ctx.params[2], ctx.params[3], resolved)
+    return (200, c) if c else (404, {"error": "no such comment"})
+
+
+def ui_review_merge(ctx):
+    repo, err, o, n = _repo(ctx)
+    if err:
+        return err
+    res = reviewsmod.merge_review(ctx.store, o, n, repo, ctx.params[2], now=util.now_iso())
+    code = {"merged": 200, "conflicts": 409, "policy-denied": 403, "invalid": 400}.get(res["status"], 400)
+    return code, res
+
+
+def ui_review_close(ctx):
+    repo, err, o, n = _repo(ctx)
+    if err:
+        return err
+    rec = reviewsmod.close_review(ctx.store, o, n, ctx.params[2], util.now_iso())
+    return (200, _ui_review(rec)) if rec else (404, {"error": "no such merge request"})
+
+
 # (method, regex, handler, required_scope) — appended to the server's ROUTES
 ROUTES = [
     ("GET", r"^/ui/health$", ui_health, None),
+    ("GET", r"^/ui/repos/([^/]+)/([^/]+)/reviews$", ui_reviews_list, "repo:read"),
+    ("POST", r"^/ui/repos/([^/]+)/([^/]+)/reviews$", ui_reviews_create, "repo:write"),
+    ("GET", r"^/ui/repos/([^/]+)/([^/]+)/reviews/([^/]+)$", ui_review_detail, "repo:read"),
+    ("POST", r"^/ui/repos/([^/]+)/([^/]+)/reviews/([^/]+)/comments$", ui_review_comment, "repo:write"),
+    ("POST", r"^/ui/repos/([^/]+)/([^/]+)/reviews/([^/]+)/comments/([^/]+)/resolve$", ui_review_comment_resolve, "repo:write"),
+    ("POST", r"^/ui/repos/([^/]+)/([^/]+)/reviews/([^/]+)/merge$", ui_review_merge, "repo:write"),
+    ("POST", r"^/ui/repos/([^/]+)/([^/]+)/reviews/([^/]+)/close$", ui_review_close, "repo:write"),
     ("GET", r"^/ui/repos$", ui_list_repos, "repo:read"),
     ("GET", r"^/ui/repos/([^/]+)/([^/]+)$", ui_get_repo, "repo:read"),
     ("GET", r"^/ui/repos/([^/]+)/([^/]+)/sessions$", ui_list_sessions, "repo:read"),

@@ -29,6 +29,9 @@ import type {
   Signature,
   TimelineEvent,
   VerificationResult,
+  MergeRequest,
+  MergeRequestDetail,
+  MRComment,
 } from "./types"
 
 export const STORAGE_KEYS = {
@@ -211,6 +214,43 @@ export const api = {
 
   getAudit: (owner: string, repo: string) =>
     request<AuditEvent[]>(`/repos/${owner}/${repo}/audit`, mockAudit),
+
+  // --- merge requests ---
+  listReviews: (owner: string, repo: string) =>
+    request<MergeRequest[]>(`/repos/${owner}/${repo}/reviews`, []),
+
+  createReview: (owner: string, repo: string, input: unknown) =>
+    request<MergeRequest>(`/repos/${owner}/${repo}/reviews`, {} as MergeRequest, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  getReview: (owner: string, repo: string, id: string) =>
+    request<MergeRequestDetail>(`/repos/${owner}/${repo}/reviews/${id}`, {} as MergeRequestDetail),
+
+  addReviewComment: (owner: string, repo: string, id: string, input: unknown) =>
+    request<MRComment>(`/repos/${owner}/${repo}/reviews/${id}/comments`, {} as MRComment, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  resolveReviewComment: (owner: string, repo: string, id: string, cid: string, resolved: boolean) =>
+    request<MRComment>(`/repos/${owner}/${repo}/reviews/${id}/comments/${cid}/resolve`, {} as MRComment, {
+      method: "POST",
+      body: JSON.stringify({ resolved }),
+    }),
+
+  mergeReview: (owner: string, repo: string, id: string) =>
+    request<{ status: string; reasons?: string[]; conflicts?: string[]; snapshot?: string }>(
+      `/repos/${owner}/${repo}/reviews/${id}/merge`,
+      { status: "merged" },
+      { method: "POST" },
+    ),
+
+  closeReview: (owner: string, repo: string, id: string) =>
+    request<MergeRequest>(`/repos/${owner}/${repo}/reviews/${id}/close`, {} as MergeRequest, {
+      method: "POST",
+    }),
 
   getIntegrity: (owner: string, repo: string) =>
     request<Integrity>(`/repos/${owner}/${repo}/integrity`, mockIntegrity),
