@@ -859,7 +859,76 @@ recorded in the ledger.
 
 ---
 
-## 16. Conformance
+## 16. Policy engine (Phase 7)
+
+Checkpoint should not just record what happened — it should **enforce what is allowed to
+happen**. A deterministic policy engine runs before sensitive operations and records every
+decision in the ledger. Policy is **opt-in**: with no policy configured
+(`.checkpoint/policy.yaml` absent and no `policy:` config block) the engine is disabled and
+nothing is enforced.
+
+### Sensitive operations
+
+`accept`, `merge`, `push` (incl. force / force-with-lease), `pull`, `bundle import`,
+`tag`, `trust`/`revoke`, and `override`. The engine is also queryable read-only via
+`policy check`/`explain` and run over history by `fsck --policy`.
+
+### PolicyInput → PolicyDecision
+
+The engine is a pure function of a **PolicyInput** (operation, actor identity + type,
+branch, changed paths, risk tags, verification results, trust status, ref-update type,
+remote/bundle metadata, override reason) and the policy. It returns a **PolicyDecision**:
+`decision_id, timestamp, operation, effect ∈ {allow, deny, warn}, actor_identity_id,
+rules_evaluated, rules_matched, reasons, required_actions, override_available,
+override_used`. Evaluation is **deterministic** and **read-only**; callers record the
+decision in the ledger (`policy` event).
+
+### Rule model
+
+- **actor_rules** gate capabilities per actor type (`can_accept`, `can_merge`, `can_push`,
+  `can_override`, …). By default agents may start sessions and snapshot but **not
+  self-accept**.
+- **path_rules** (glob: `dir/`, `**`, `*.ext`) attach requirements to changed paths:
+  `trusted_human_acceptor`, `signed_accept`, `verification: [...]`,
+  `forbid_agent_self_accept`, `min_approvals`, `verification_optional`.
+- **branch_rules** (glob, e.g. `release/*`) attach `signed_merge`, `fast_forward_only`,
+  `trusted_acceptor`, `no_unsigned_history`, `verification`.
+- **required_signatures** (accepts/merges/tags/remote_ref_updates) and
+  **required_verification** (default + commands) apply globally.
+- **remote_rules** govern push/pull (`require_fast_forward`, `allow_force_push`,
+  `allow_force_with_lease`, `require_signed_snapshots`, `reject_unsigned_remote_history`).
+- **override_rules** (`allow_override`, `require_reason`, `require_signature`,
+  `allowed_identity_types`).
+
+**Strictest wins**: when several rules match, their requirements are **unioned** (any
+`True` wins, verification lists merge), so the most restrictive constraint applies. Path
+globbing is deterministic. `default_effect: deny` means an operation with no permitting
+actor rule is denied.
+
+### Override
+
+A denied operation may be overridden only if `override_rules.allow_override` is set, the
+actor type is allowed (humans by default), a **reason** is supplied (`--override --reason`),
+and — when an identity is active — the override is signed. The override and its reason are
+recorded in the ledger (`override_used: true`).
+
+### Integration
+
+`accept` evaluates after verification (so results are known) and before the commit;
+`merge` enforces protected-branch and signed-merge rules; `push` enforces fast-forward and
+force policy; `pull` can refuse unsigned remote history; `bundle import` can reject unsigned
+bundles; `trust`/`revoke` record a decision. The simple Phase-5 `trust:` acceptor gate is
+**superseded by the policy engine** when a policy is present. `fsck --policy` evaluates
+accepted history against the current policy and reports **policy violations separately**
+from object corruption (they do not mark the store corrupt). Everything works with Git
+uninstalled; the engine never imports Git.
+
+Commands: `policy show | check [--operation] | explain [<decision-id>] | validate |
+test <fixture> | init | audit`.
+
+---
+
+## 17. Conformance
 
 An implementation conforms to Checkpoint Core Protocol 0.1 if it:
 
@@ -892,6 +961,10 @@ An implementation conforms to Checkpoint Core Protocol 0.1 if it:
     `--force-with-lease`, atomic ref updates, and bundle verification (path-safety,
     private-key rejection, manifest/seal/signature checks) — verifying everything before
     refs move and never transferring private keys.
-13. Passes the test: **with Git uninstalled, all of the above — including the autosave
-    daemon, timeline, recovery, rename detection, fsck, gc, signing/verification, and
-    remote sync — still work.**
+13. Provides a deterministic, opt-in **policy engine** (§16) that enforces who/what may
+    accept, merge, push, pull, tag, trust, and override — before the operation — records
+    every decision in the ledger, supports reasoned signed overrides, and integrates with
+    fsck; superseding the simple Phase-5 trust gate when configured.
+14. Passes the test: **with Git uninstalled, all of the above — including the autosave
+    daemon, timeline, recovery, rename detection, fsck, gc, signing/verification, remote
+    sync, and the policy engine — still work.**

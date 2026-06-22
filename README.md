@@ -168,7 +168,8 @@ checkpoint-core git-import ./legacy-repo # import a Git repo; Checkpoint becomes
 | `verify-history` | Recompute SHA-256 seals across accepted history; flags tampering. |
 | `identity create\|list\|show\|trust\|untrust\|revoke\|import\|export\|current\|use` | Manage Ed25519 signing identities and local trust. |
 | `sign <snapshot>` / `verify-signatures` / `trust-status` | Sign history, verify all signatures, summarize trust. |
-| `fsck [--strict --json --verify-signatures --require-signatures]` | Read-only integrity check: hashes, seals, refs, trees, parents, sessions, renames, signatures. |
+| `policy init\|show\|check\|explain\|validate\|test\|audit` | Opt-in policy engine: enforce who/what may change history; audit every decision. |
+| `fsck [--strict --json --verify-signatures --require-signatures --policy]` | Read-only integrity check: hashes, seals, refs, trees, parents, sessions, renames, signatures, policy. |
 | `gc [--dry-run --aggressive --force]` | Safely collect unreachable, past-grace objects (fsck-gated, quarantined). |
 | `objects stats / list [--reachable\|--unreachable\|--type] / show <id>` | Inspect the object store. |
 | `doctor` | Diagnose the installation. |
@@ -315,6 +316,33 @@ checkpoint-core sync status origin         # ahead / behind / diverged
   do, so another machine can verify the trust chain; imported identities arrive untrusted.
   Autosaves don't transfer unless you explicitly enable it. See §15 of the spec.
 
+## Enforce what's allowed, not just record what happened (policy engine)
+
+A trusted store records change. A **controlled system of record** enforces *who or what is
+allowed to make it.* The opt-in policy engine evaluates sensitive operations **before** they
+happen and records every decision in the ledger.
+
+```bash
+checkpoint-core policy init                 # starter policy; enforcement now active
+checkpoint-core policy check --operation accept
+checkpoint-core accept -m "fix"             # ALLOW/DENY decided by policy, then recorded
+checkpoint-core policy audit                # every decision + overrides
+```
+
+- **Who may accept?** `actor_rules` gate capabilities by identity type — by default an **AI
+  agent may not self-accept**; a human or CI must approve.
+- **Path & branch rules.** `src/safety/**` can require a **trusted human acceptor**, a
+  **signed accept**, and named **verification** (e.g. `safety_tests`); `main`/`release/*`
+  can require **signed merges** and **fast-forward only**. When multiple rules match, the
+  **strictest wins**.
+- **Required signatures & verification** are enforced globally; **remote rules** govern
+  force-push and unsigned remote history; **bundle import** can reject unsigned history.
+- **Reasoned, audited overrides.** A trusted human can override a denial with
+  `--override --reason "..."` — recorded in the ledger; agents can't.
+- **Deterministic & local-first.** Same input → same decision (`--json` for automation).
+  `fsck --policy` evaluates accepted history against the current policy. Opt-in: with no
+  policy configured, nothing is enforced. See §16 of the spec.
+
 ## How it works (native objects, no Git)
 
 - **Blob** — raw file bytes, addressed by `sha256(bytes)`.
@@ -380,8 +408,10 @@ It is a bridge for adoption, not the protocol. See
 5. **Phase 5 (done):** signed identity & trust (Ed25519) — provable authorship and approval.
 6. **Phase 6 (done):** hardened remote sync — fetch/pull/push/clone/bundles, verify before
    refs move, never trust the remote.
-7. **Next:** policy engine; hosted Checkpoint service API; web review UI; agent integrations
-   (Cursor, Claude Code, Codex, Copilot); public developer preview.
+7. **Phase 7 (done):** policy engine — enforce who/what may change history, with audit and
+   reasoned overrides.
+8. **Next:** hosted Checkpoint service API; web review UI; agent integrations (Cursor,
+   Claude Code, Codex, Copilot); public developer preview.
 4. **Phase 4:** hosted Checkpoint service (same object model and sync verbs over HTTP).
 5. **Phase 5:** web UI for sessions, diffs, prompts, verification, approvals, rollback.
 6. **Phase 6:** team workflow, policy engine, compliance, audit, enterprise controls.

@@ -14,9 +14,9 @@ from typing import List, Optional
 from . import __version__, objects, util
 from . import autosave as autosavemod, engine, ledger as ledgermod
 from . import fsck as fsckmod, gc as gcmod, reachable as reachablemod
-from . import identity as idmod, merge as mergemod, secrets as secretscan
-from . import remote as remotemod, sign as signmod, timeline as timelinemod
-from . import sync as syncmod, verify as verifymod
+from . import identity as idmod, merge as mergemod, policy as policymod
+from . import remote as remotemod, secrets as secretscan, sign as signmod
+from . import timeline as timelinemod, sync as syncmod, verify as verifymod
 from .watcher import Watcher
 from .config import Config, default_config
 from .diff import diff_result, tree_diff, unified, unified_result
@@ -188,10 +188,14 @@ def cmd_identity(args) -> int:
         return 0
 
     if sub in ("trust", "untrust"):
-        rec = idmod.set_trust(repo, args.id, sub == "trust")
-        if not rec:
+        if idmod.load(repo, args.id) is None:
             err("no such identity: {}".format(args.id))
             return 1
+        ok, decision = policy_gate(repo, None, "trust")   # records a policy decision when enabled
+        if not ok:
+            _print_denial(decision)
+            return 1
+        rec = idmod.set_trust(repo, args.id, sub == "trust")
         ledgermod.append(repo, "trust", None, repo.identity(),
                          {"identity": rec["identity_id"], "trusted": sub == "trust"})
         info(util.green("Identity {} is now {}.".format(rec["identity_id"], sub + "ed")))
@@ -492,11 +496,11 @@ def cmd_accept(args) -> int:
         err("risk rule requires a human to accept this session (actor is an agent).")
         return 1
 
-    # --- trust policy (Phase 5) ---
-    trust = repo.config.trust()
+    # --- simple trust policy (Phase 5) — superseded by the policy engine when one exists ---
     signer = idmod.current(repo)
     signer_can_sign = bool(signer and idmod.has_private(repo, signer["identity_id"]))
-    if not args.force:
+    if policymod.load(repo) is None and not args.force:
+        trust = repo.config.trust()
         if trust.get("require_signed_accepts") and not signer_can_sign:
             err("trust policy requires a signed accept, but no signing identity is active.")
             info("Create/select one: checkpoint-core identity create --name \"You\"")
@@ -555,6 +559,13 @@ def cmd_accept(args) -> int:
         err("nothing to accept; the working tree matches the branch head.")
         info("Use `checkpoint-core rollback` to discard, or `reject` to close.")
         return 1
+
+    # Policy engine (opt-in): enforce who/what may accept and under which conditions.
+    if not args.force:
+        ok, decision = policy_gate(repo, sess, "accept", args=args)
+        if not ok:
+            _print_denial(decision)
+            return 1
     if verification_ref is None:
         runs = sess.data.get("verifications", [])
         verification_ref = runs[-1] if runs else None
@@ -820,6 +831,14 @@ def cmd_merge(args) -> int:
         info("Resolve the markers, then start a session and accept to record the merge.")
         return 1
 
+    # Policy engine (opt-in): protected-branch + signed-merge enforcement.
+    merged_paths = [r["new_path"] for r in result.get("rename_records", [])] + list(result.get("auto_merged", []))
+    ok, decision = policy_gate(repo, None, "merge", args=args, branch=branch,
+                               changed_paths=merged_paths)
+    if not ok:
+        _print_denial(decision)
+        return 1
+
     materialize(repo, result["merged_tree"], delete_extra=True)
     snap = objects.make_snapshot(
         tree=result["merged_tree"], parents=[ours, theirs], session=None,
@@ -915,6 +934,19 @@ def cmd_fetch(args) -> int:
 def cmd_pull(args) -> int:
     repo = _repo()
     branch = args.branch or getattr(args, "branch_opt", None) or repo.head_branch()
+    # Policy: optionally refuse unsigned remote history before moving the local branch.
+    if policymod.load(repo) is not None and not args.dry_run:
+        try:
+            rr = remotemod.remote_repo(remotemod.get_remote(repo, args.remote) or {})
+            rhead = rr.read_ref("refs/heads/{}".format(branch))
+            remote_unsigned = bool(rhead) and not signmod.signatures_for(rr, rhead)
+            ok, decision = policy_gate(repo, None, "pull", args=args, branch=branch,
+                                       remote_unsigned=remote_unsigned)
+            if not ok:
+                _print_denial(decision)
+                return 1
+        except ValueError:
+            pass
     try:
         res = remotemod.pull(repo, args.remote, branch,
                              verify_signatures=args.verify_signatures, dry_run=args.dry_run)
@@ -952,6 +984,12 @@ def cmd_pull(args) -> int:
 def cmd_push(args) -> int:
     repo = _repo()
     branch = args.branch or repo.head_branch()
+    ut = "force" if getattr(args, "force", False) else (
+        "force_with_lease" if args.force_with_lease is not None else "fast_forward")
+    ok, decision = policy_gate(repo, None, "push", args=args, branch=branch, ref_update_type=ut)
+    if not ok:
+        _print_denial(decision)
+        return 1
     try:
         res = remotemod.push(repo, args.remote, branch, tags=args.tags,
                              force_with_lease=args.force_with_lease, dry_run=args.dry_run)
@@ -1079,6 +1117,19 @@ def cmd_bundle(args) -> int:
             info(util.red("  " + e))
         return 1
     if sub == "import":
+        # Policy: optionally reject unsigned bundle history before importing.
+        if policymod.load(repo) is not None:
+            import tarfile as _tf
+            try:
+                with _tf.open(args.path, "r:gz") as t:
+                    has_sig = any(n.startswith("signatures/") for n in t.getnames())
+            except Exception:
+                has_sig = False
+            ok, decision = policy_gate(repo, None, "bundle_import", args=args,
+                                       bundle_unsigned=not has_sig, require_signed=True)
+            if not ok:
+                _print_denial(decision)
+                return 1
         res = syncmod.import_bundle(repo, Path(args.path), args.name,
                                     require_signatures=args.verify_signatures)
         if not res.get("ok"):
@@ -1387,6 +1438,101 @@ def _dump(obj) -> str:
     return json.dumps(obj, indent=2, ensure_ascii=False)
 
 
+# --------------------------------------------------- policy plumbing (Phase 7)
+
+def _passed_verifications(repo, session) -> list:
+    """Names of verification commands that passed in the session's latest run."""
+    rec = verifymod.last_verification(repo, session) if session else {}
+    if not rec:
+        return []
+    return [r["name"] for r in rec.get("results", []) if r.get("status") == "passed"]
+
+
+def _signer_actor(repo, session=None):
+    """(actor_type, identity_dict, will_sign) for the active signing identity or session actor."""
+    signer = idmod.current(repo)
+    if signer:
+        return signer.get("type", "human"), signer, idmod.has_private(repo, signer["identity_id"])
+    actor = session.actor() if session else {"type": "human"}
+    return actor.get("type", "human"), {"id": actor.get("id"), "trusted": True}, False
+
+
+def build_policy_input(repo, session, operation, **extra):
+    actor_type, identity, will_sign = _signer_actor(repo, session)
+    changed = []
+    if session is not None:
+        try:
+            dr = diff_result(repo, session.base_tree, scan_to_tree(repo))
+            changed = ([f for f in dr["added"]] + [f for f in dr["deleted"]]
+                       + [f for f in dr["modified"]] + [r["new_path"] for r in dr["renamed"]])
+        except Exception:
+            changed = []
+    pin = {
+        "operation": operation,
+        "actor_type": actor_type,
+        "actor_identity": identity,
+        "trust_status": "trusted" if identity.get("trusted") else "untrusted",
+        "branch": repo.head_branch(),
+        "session_id": session.id if session else None,
+        "changed_paths": changed,
+        "risk_tags": session.data.get("risk_tags", []) if session else [],
+        "verification_passed": _passed_verifications(repo, session),
+        "will_sign": will_sign,
+    }
+    pin.update(extra)
+    return pin
+
+
+def _record_decision(repo, decision, session_id=None):
+    ledgermod.append(repo, "policy", session_id, repo.identity(), {
+        "operation": decision["operation"], "effect": decision["effect"],
+        "decision_id": decision["decision_id"], "reasons": decision["reasons"],
+        "rules_matched": decision["rules_matched"], "override_used": decision.get("override_used"),
+    })
+
+
+def policy_gate(repo, session, operation, args=None, **extra):
+    """Enforce policy for a sensitive op. Returns (allowed, decision_or_None).
+
+    Disabled (allow, None) when no policy is configured.
+    """
+    pol = policymod.load(repo)
+    if pol is None:
+        return True, None
+    pin = build_policy_input(repo, session, operation, **extra)
+    decision = policymod.evaluate(pol, pin)
+    sid = session.id if session else None
+    if decision["effect"] == "deny" and getattr(args, "override", False):
+        opin = build_policy_input(repo, session, "override", reason=getattr(args, "reason", None),
+                                  base_operation=operation)
+        odec = policymod.evaluate(pol, opin)
+        if odec["effect"] == "allow":
+            decision["effect"] = "allow"
+            decision["override_used"] = True
+            decision["reasons"].append("OVERRIDE: {}".format(getattr(args, "reason", "") or ""))
+            if odec.get("actor_identity_id"):
+                signer = idmod.current(repo)
+                if signer and idmod.has_private(repo, signer["identity_id"]):
+                    pass  # override is recorded in the ledger (actor stamped); seal optional
+            _record_decision(repo, decision, sid)
+            return True, decision
+        decision["override_attempt"] = odec["reasons"]
+    _record_decision(repo, decision, sid)
+    return decision["effect"] != "deny", decision
+
+
+def _print_denial(decision):
+    err("policy DENY {}".format(decision["operation"]))
+    for r in decision["reasons"]:
+        info(util.red("  - " + r))
+    if decision["required_actions"]:
+        info(util.bold("  required actions:"))
+        for a in decision["required_actions"]:
+            info("    * " + a)
+    if decision.get("override_available"):
+        info(util.dim("  (a trusted human may override with --override --reason \"...\")"))
+
+
 def cmd_fsck(args) -> int:
     repo = _repo()
     report = fsckmod.check(repo, strict=args.strict)
@@ -1404,6 +1550,12 @@ def cmd_fsck(args) -> int:
                     "signature policy: {} unsigned, {} invalid, {} revoked accepted snapshot(s)".format(
                         len(sig_findings["unsigned_accepted"]), sig_findings["invalid"],
                         sig_findings["revoked"]))
+
+    if getattr(args, "policy", False):
+        pol = policymod.load(repo)
+        violations = _policy_findings(repo, pol) if pol else []
+        report["policy_violations"] = violations
+        # policy violations are reported separately; they do not mark the store "corrupt"
 
     if args.json:
         print(_dump(report))
@@ -1429,6 +1581,13 @@ def cmd_fsck(args) -> int:
         info("    valid: {}  untrusted: {}  unknown: {}  invalid: {}".format(
             sig_findings["valid"], sig_findings["untrusted"],
             sig_findings["unknown_signer"], sig_findings["invalid"]))
+    if "policy_violations" in report:
+        info(util.bold("  policy:"))
+        if report["policy_violations"]:
+            for v in report["policy_violations"]:
+                info(util.yellow("    VIOLATION  " + v))
+        else:
+            info("    no policy violations")
     res = report["result"]
     color = {"healthy": util.green, "warnings": util.yellow, "corrupt": util.red}[res]
     info("\nResult: " + color(res))
@@ -1676,6 +1835,148 @@ def cmd_trust_status(args) -> int:
     return 0
 
 
+# ----------------------------------------------------------------- policy (Phase 7)
+
+def cmd_policy(args) -> int:
+    repo = _repo()
+    sub = args.policy_cmd or "show"
+
+    if sub == "init":
+        if policymod.policy_path(repo).exists() and not getattr(args, "force", False):
+            err("policy already exists: {} (use --force to overwrite)".format(policymod.policy_path(repo)))
+            return 1
+        policymod.save_starter(repo)
+        info(util.green("Wrote starter policy ") + str(policymod.policy_path(repo)))
+        info("Policy enforcement is now ACTIVE for accept/merge/push/pull/bundle/trust.")
+        return 0
+
+    if sub == "show":
+        pol = policymod.load(repo)
+        if pol is None:
+            info("No policy configured (enforcement disabled). Run `checkpoint-core policy init`.")
+            return 0
+        if getattr(args, "json", False):
+            print(_dump(pol))
+        else:
+            import yaml as _y
+            print(_y.safe_dump(pol, sort_keys=False))
+        return 0
+
+    if sub == "validate":
+        pol = policymod.load(repo)
+        if pol is None:
+            info("No policy configured.")
+            return 0
+        errs = policymod.validate(pol)
+        if errs:
+            err("policy is INVALID:")
+            for e in errs:
+                info(util.red("  - " + e))
+            return 1
+        info(util.green("policy is valid."))
+        return 0
+
+    if sub in ("check", "explain"):
+        pol = policymod.load(repo)
+        if pol is None:
+            info("No policy configured (enforcement disabled).")
+            return 0
+        if sub == "explain" and getattr(args, "decision_id", None):
+            for e in reversed(ledgermod.read_all(repo)):
+                if e["event_type"] == "policy" and e["payload"].get("decision_id") == args.decision_id:
+                    print(_dump(e["payload"]))
+                    return 0
+            err("no such policy decision: {}".format(args.decision_id))
+            return 1
+        operation = getattr(args, "operation", None) or "accept"
+        sess = Session.active(repo)
+        pin = build_policy_input(repo, sess, operation)
+        decision = policymod.evaluate(pol, pin)   # READ-ONLY: not recorded
+        if getattr(args, "json", False):
+            print(_dump(decision))
+            return 0 if decision["effect"] != "deny" else 1
+        glyph = util.green("ALLOW") if decision["effect"] == "allow" else util.red("DENY")
+        info("{} {}".format(glyph, operation))
+        if decision["rules_matched"]:
+            info(util.bold("Matched rules:"))
+            for r in decision["rules_matched"]:
+                info("  * " + r)
+        if decision["reasons"]:
+            info(util.bold("Reasons:"))
+            for r in decision["reasons"]:
+                info(util.red("  - " + r))
+        if decision["required_actions"]:
+            info(util.bold("Required actions:"))
+            for a in decision["required_actions"]:
+                info("  * " + a)
+        return 0 if decision["effect"] != "deny" else 1
+
+    if sub == "test":
+        fixture = util.read_json(args.fixture, None)
+        if fixture is None:
+            import yaml as _y
+            try:
+                fixture = _y.safe_load(Path(args.fixture).read_text(encoding="utf-8"))
+            except Exception:
+                err("cannot read fixture: {}".format(args.fixture))
+                return 1
+        pol = fixture.get("policy") or policymod.load(repo) or {}
+        decision = policymod.evaluate(pol, fixture.get("input", {}))
+        expect = fixture.get("expect")
+        ok = expect is None or decision["effect"] == expect
+        info(("{} ".format(util.green("PASS") if ok else util.red("FAIL"))) +
+             "{} -> {} (expected {})".format(fixture.get("input", {}).get("operation"),
+                                             decision["effect"], expect))
+        if not ok and decision["reasons"]:
+            for r in decision["reasons"]:
+                info(util.red("  - " + r))
+        return 0 if ok else 1
+
+    if sub == "audit":
+        rows = [e for e in ledgermod.read_all(repo) if e["event_type"] == "policy"]
+        if not rows:
+            info("No policy decisions recorded.")
+            return 0
+        info(util.bold("{:<22} {:<10} {:<8} {}".format("WHEN", "OP", "EFFECT", "DECISION")))
+        for e in rows[-50:]:
+            p = e["payload"]
+            eff = p.get("effect", "?")
+            color = util.green if eff == "allow" else util.red
+            mark = " (override)" if p.get("override_used") else ""
+            info("{:<22} {:<10} {:<8} {}{}".format(
+                e["timestamp"][:19], p.get("operation", "?"), color(eff),
+                p.get("decision_id", "")[:18], mark))
+        return 0
+
+    err("unknown policy subcommand")
+    return 2
+
+
+def _policy_findings(repo, pol) -> List[str]:
+    """Evaluate accepted history against the current policy (used by fsck --policy)."""
+    findings: List[str] = []
+    rs = pol.get("required_signatures", {}) or {}
+    accepted = []
+    seen = set()
+    for kind_dir in ("heads", "tags"):
+        d = repo.paths.base / "refs" / kind_dir
+        if d.exists():
+            for ref in d.iterdir():
+                if ref.is_file():
+                    for oid in repo.history(ref.read_text(encoding="utf-8").strip()):
+                        if oid not in seen:
+                            seen.add(oid)
+                            accepted.append(oid)
+    for oid in accepted:
+        if rs.get("accepts"):
+            sigs = signmod.signatures_for(repo, oid)
+            if not sigs:
+                findings.append("accepted snapshot {} is unsigned (policy requires signed accepts)".format(oid[:12]))
+            elif not any(signmod.verify_record(repo, s)["ok"] for s in sigs):
+                findings.append("accepted snapshot {} has no valid signature".format(oid[:12]))
+    return findings
+
+
 # ------------------------------------------------------------------------ parser
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1747,6 +2048,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-verify", action="store_true")
     sp.add_argument("--no-sign", action="store_true", help="do not sign even if an identity is active")
     sp.add_argument("--force", action="store_true")
+    sp.add_argument("--override", action="store_true", help="override a policy denial (requires --reason)")
+    sp.add_argument("--reason", help="reason for a policy override")
     sp.set_defaults(func=cmd_accept)
 
     sp = sub.add_parser("reject", help="reject the session (auditable, no history)")
@@ -1783,6 +2086,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("merge", help="merge a branch into the current branch")
     sp.add_argument("name")
+    sp.add_argument("--override", action="store_true", help="override a policy denial (requires --reason)")
+    sp.add_argument("--reason", help="reason for a policy override")
     sp.set_defaults(func=cmd_merge)
 
     sp = sub.add_parser("remote", help="manage remotes")
@@ -1906,7 +2211,24 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--verify-signatures", action="store_true", help="also verify signatures")
     sp.add_argument("--require-signatures", action="store_true",
                     help="fail on unsigned/invalid accepted snapshots")
+    sp.add_argument("--policy", action="store_true", help="evaluate accepted history against policy")
     sp.set_defaults(func=cmd_fsck)
+
+    sp = sub.add_parser("policy", help="policy engine: show/check/explain/validate/test/init/audit")
+    psub = sp.add_subparsers(dest="policy_cmd")
+    pin_ = psub.add_parser("init"); pin_.add_argument("--force", action="store_true")
+    psh = psub.add_parser("show"); psh.add_argument("--json", action="store_true")
+    psub.add_parser("validate")
+    pck = psub.add_parser("check")
+    pck.add_argument("--operation", default="accept")
+    pck.add_argument("--json", action="store_true")
+    pex = psub.add_parser("explain")
+    pex.add_argument("decision_id", nargs="?")
+    pex.add_argument("--operation", default="accept")
+    pex.add_argument("--json", action="store_true")
+    pts = psub.add_parser("test"); pts.add_argument("fixture")
+    psub.add_parser("audit")
+    sp.set_defaults(func=cmd_policy, policy_cmd=None)
 
     sp = sub.add_parser("sign", help="sign a snapshot with the active identity")
     sp.add_argument("object_id")
