@@ -13,6 +13,7 @@ from typing import List, Optional
 
 from . import __version__, objects, util
 from . import autosave as autosavemod, engine, ledger as ledgermod
+from . import fsck as fsckmod, gc as gcmod, reachable as reachablemod
 from . import merge as mergemod, secrets as secretscan, timeline as timelinemod
 from . import sync as syncmod, verify as verifymod
 from .watcher import Watcher
@@ -1038,6 +1039,150 @@ def cmd_recover(args) -> int:
     return 0
 
 
+# --------------------------------------------------- fsck / gc / objects (Phase 4)
+
+def _dump(obj) -> str:
+    import json
+    return json.dumps(obj, indent=2, ensure_ascii=False)
+
+
+def cmd_fsck(args) -> int:
+    repo = _repo()
+    report = fsckmod.check(repo, strict=args.strict)
+    if args.json:
+        # strip large nested fsck echoes for cleanliness
+        print(_dump(report))
+        return fsckmod.exit_code(report, strict=args.strict)
+    info(util.bold("Checkpoint fsck"))
+    info("  objects scanned:  {}".format(report["objects_scanned"]))
+    info("  refs scanned:     {}".format(report["refs_scanned"]))
+    info("  sessions scanned: {}".format(report["sessions_scanned"]))
+    info("  reachable:        {}".format(report["reachable"]))
+    info("  dangling:         {}".format(report["dangling"]))
+    info("  corrupt:          {}".format(len(report["corrupt"])))
+    info("  missing:          {}".format(len(report["missing"])))
+    for c in report["corrupt"][:50]:
+        info(util.red("  CORRUPT  {} — {}".format(c["id"][:12], c["reason"])))
+    for e in report["errors"][:100]:
+        info(util.red("  ERROR    {}".format(e)))
+    for w in report["warnings"][:100]:
+        info(util.yellow("  warning  {}".format(w)))
+    res = report["result"]
+    color = {"healthy": util.green, "warnings": util.yellow, "corrupt": util.red}[res]
+    info("\nResult: " + color(res))
+    return fsckmod.exit_code(report, strict=args.strict)
+
+
+def cmd_gc(args) -> int:
+    repo = _repo()
+    report = gcmod.collect(repo, dry_run=args.dry_run, aggressive=args.aggressive, force=args.force)
+    if report.get("aborted"):
+        err(report["reason"])
+        return 1
+    info(util.bold("Checkpoint gc" + (" (dry-run)" if args.dry_run else "")))
+    info("  objects scanned:  {}".format(report["objects_scanned"]))
+    info("  reachable:        {}".format(report["reachable"]))
+    info("  candidates:       {}".format(len(report["candidates"])))
+    info("  quarantined:      {}".format(report["quarantined"]))
+    info("  deleted:          {}".format(report["deleted"]))
+    info("  bytes reclaimed:  {}".format(report["bytes_reclaimed"]))
+    info("  skipped:          {}".format(report["skipped"]))
+    if report.get("purged_quarantine"):
+        info("  quarantine purged: {} batch(es)".format(report["purged_quarantine"]))
+    if args.dry_run:
+        for oid in report["candidates"][:50]:
+            info(util.dim("  would collect {}".format(oid[:12])))
+    else:
+        ledgermod.append(repo, "gc", None, repo.identity(), {
+            "quarantined": report["quarantined"], "deleted": report["deleted"],
+            "bytes_reclaimed": report["bytes_reclaimed"], "aggressive": args.aggressive,
+        })
+    return 0
+
+
+def _reachable_set(repo):
+    gcfg = repo.config.gc()
+    walk = reachablemod.compute_reachable(
+        repo, keep_autosaves_days=float(gcfg.get("keep_autosaves_days", 14)),
+        keep_rejected_days=float(gcfg.get("keep_rejected_sessions_days", 30)))
+    return walk["reachable"]
+
+
+def cmd_objects(args) -> int:
+    repo = _repo()
+    sub = args.objects_cmd or "stats"
+    if sub == "stats":
+        counts = {"blob": 0, "tree": 0, "snapshot_accepted": 0, "snapshot_intermediate": 0, "unknown": 0}
+        sizes = dict(counts)
+        total = 0
+        for oid in reachablemod.iter_object_ids(repo):
+            kind, obj = reachablemod.classify(repo, oid)
+            size = reachablemod.object_size(repo, oid)
+            total += size
+            if kind == "snapshot":
+                key = "snapshot_accepted" if obj.get("kind") == objects.KIND_ACCEPTED else "snapshot_intermediate"
+            elif kind == "tree":
+                key = "tree"
+            elif kind == "blob":
+                key = "blob"
+            else:
+                key = "unknown"
+            counts[key] += 1
+            sizes[key] += size
+        autosaves = vers = 0
+        for sid in repo.session_ids():
+            sess = util.read_json(repo.paths.session_dir(sid) / "session.json", {})
+            autosaves += len(sess.get("autosaves", []))
+            vers += len(sess.get("verifications", []))
+        info(util.bold("Object store stats"))
+        for k in ("blob", "tree", "snapshot_accepted", "snapshot_intermediate", "unknown"):
+            info("  {:<22} {:>6}  {:>10} bytes".format(k, counts[k], sizes[k]))
+        info("  {:<22} {:>6}  {:>10} bytes".format("TOTAL", sum(counts.values()), total))
+        info(util.dim("  (filesystem) autosave records: {}, verification records: {}".format(autosaves, vers)))
+        return 0
+    if sub == "list":
+        reachable = _reachable_set(repo)
+        for oid in reachablemod.iter_object_ids(repo):
+            kind, obj = reachablemod.classify(repo, oid)
+            if args.type and kind != args.type:
+                continue
+            is_reach = oid in reachable
+            if args.reachable and not is_reach:
+                continue
+            if args.unreachable and is_reach:
+                continue
+            tag = "reachable" if is_reach else "UNREACHABLE"
+            info("{}  {:<10} {}".format(oid[:16], kind, tag))
+        return 0
+    if sub == "show":
+        oid = args.object_id
+        kind, obj = reachablemod.classify(repo, oid)
+        if kind == "missing":
+            err("no such object: {}".format(oid))
+            return 1
+        reachable = _reachable_set(repo)
+        info(util.bold("Object ") + util.cyan(oid))
+        info("  type:      {}".format(kind))
+        info("  size:      {} bytes".format(reachablemod.object_size(repo, oid)))
+        info("  reachable: {}".format(oid in reachable))
+        if kind == "tree":
+            entries = obj.get("entries", [])
+            info("  entries:   {}".format(len(entries)))
+            for e in entries[:50]:
+                info("    {} {} {}".format(e.get("mode"), e.get("blob", "")[:12], e.get("path")))
+        elif kind == "snapshot":
+            info("  kind:      {}".format(obj.get("kind")))
+            info("  message:   {}".format(obj.get("message")))
+            info("  tree:      {}".format((obj.get("tree") or "")[:12]))
+            info("  parents:   {}".format([p[:12] for p in obj.get("parents", [])]))
+            info("  session:   {}".format(obj.get("session")))
+            if obj.get("kind") == objects.KIND_ACCEPTED:
+                info("  seal:      {}".format("valid" if objects.verify_seal(obj) else util.red("INVALID")))
+        return 0
+    err("unknown objects subcommand")
+    return 2
+
+
 # ------------------------------------------------------------------------ parser
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1200,6 +1345,30 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--to", help="restore a specific autosave id")
     sp.add_argument("--yes", action="store_true")
     sp.set_defaults(func=cmd_recover)
+
+    # --- Phase 4: integrity + garbage collection ---
+    sp = sub.add_parser("fsck", help="read-only integrity check of the store")
+    sp.add_argument("--strict", action="store_true", help="fail on warnings/dangling objects")
+    sp.add_argument("--json", action="store_true", help="machine-readable output")
+    sp.set_defaults(func=cmd_fsck)
+
+    sp = sub.add_parser("gc", help="garbage-collect unreachable objects (safe, quarantined)")
+    sp.add_argument("--dry-run", action="store_true", help="show what would be collected")
+    sp.add_argument("--aggressive", action="store_true",
+                    help="shorter grace; include past-retention rejected-session objects")
+    sp.add_argument("--force", action="store_true", help="skip the pre-gc fsck gate")
+    sp.set_defaults(func=cmd_gc)
+
+    sp = sub.add_parser("objects", help="inspect the object store")
+    osub = sp.add_subparsers(dest="objects_cmd")
+    osub.add_parser("stats")
+    olist = osub.add_parser("list")
+    olist.add_argument("--reachable", action="store_true")
+    olist.add_argument("--unreachable", action="store_true")
+    olist.add_argument("--type", choices=["blob", "tree", "snapshot"])
+    oshow = osub.add_parser("show")
+    oshow.add_argument("object_id")
+    sp.set_defaults(func=cmd_objects, objects_cmd=None)
     return p
 
 

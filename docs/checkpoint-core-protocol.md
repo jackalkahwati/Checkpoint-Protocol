@@ -451,9 +451,13 @@ commit/snapshot ids differ because the object formats differ by design.
   HEAD                   # "ref: refs/heads/main" or a raw sha (detached)
   refs/
     heads/<branch>       # -> accepted snapshot sha
+    tags/<tag>           # -> accepted snapshot sha (protected root)
     remotes/<remote>/<branch>
   objects/
     <ab>/<sha256>        # blobs and structured objects (content-addressed)
+  quarantine/<stamp>/    # gc holding area before permanent deletion (§13)
+    <ab>/<sha256>
+    manifest.json
   sessions/
     <session-id>/
       session.json       # the session object (mutable while active)
@@ -583,7 +587,95 @@ autosave:
 
 ---
 
-## 13. Conformance
+## 13. Integrity (fsck) and garbage collection (Phase 4)
+
+Storage hygiene and trust. Two separate systems: **fsck** (read-only integrity) and
+**gc** (safe deletion of only what is provably unreachable). Both work with Git
+uninstalled and never call Git.
+
+### Reachability model
+
+A **reachability walker** marks every object reachable from a **protected root**:
+
+- `refs/heads/*` and `refs/tags/*` → accepted snapshots → parent chains → trees → blobs;
+- the active-session pointer, and every session record's `base.tree`, `base.head`,
+  `snapshots[]`, and `result.snapshot`;
+- each session's **verification-record trees** and **packet trees**;
+- **autosave trees** within the retention window (`keep_autosaves_days`; an active session
+  retains all of its autosaves).
+
+Truth is rebuilt from objects + refs + sessions on every run — there is no authoritative
+index, so a stale index can never cause data loss. Object **type is intrinsic to content**
+(a structured object is JSON with `type ∈ {tree, snapshot}`; everything else is a blob).
+
+Definitions:
+- **Reachable** — referenced from a protected root.
+- **Unreachable** — not reachable from any protected root.
+- **Dangling** — unreachable but still within the grace period (kept).
+- **Garbage** — unreachable and older than the grace period (collectible).
+- **Corrupt** — an object whose content hash, schema, tree/blob/parent references, or seal
+  does not validate.
+
+### fsck behavior
+
+Read-only. Walks `refs → snapshots → trees → blobs` and verifies:
+content-addressed id == `sha256(bytes)`; accepted-snapshot **seals**; trees' blobs exist;
+snapshots' trees exist and are trees; parent chains resolve to snapshots; branch/tag heads
+point to valid **accepted** snapshots; sessions reference valid baselines/snapshots/
+autosave trees; timeline events are parseable; packet **rename records** reference existing
+blobs; no conflicting-type ids; no unknown structured types. Reports:
+`objects_scanned, refs_scanned, sessions_scanned, reachable, dangling, corrupt, missing,
+warnings, errors, result ∈ {healthy, warnings, corrupt}`. `--strict` promotes warnings
+(incl. dangling objects) to a failing result; `--json` emits the report. Exit code: `0`
+healthy, `1` warnings-in-strict, `2` corrupt. fsck never modifies the store (repair is out
+of scope for this phase).
+
+### gc behavior
+
+Deletes only **garbage**. It must never delete anything reachable: accepted history,
+branch heads, tagged snapshots, active-session objects, or retained autosaves. Steps:
+
+1. Run fsck first (unless `--force`); **abort if the store is corrupt**.
+2. Purge expired quarantine batches (`quarantine_days`).
+3. Compute reachability; `candidates = on-disk − reachable`, filtered to those older than
+   `grace_period_days`.
+4. Move candidates into `quarantine/<stamp>/` (crash-safe two-stage delete) with a
+   `manifest.json`; a later run purges the quarantine.
+5. Record a `gc` ledger event and return a report:
+   `objects_scanned, reachable, candidates, quarantined, deleted, bytes_reclaimed,
+   skipped{reason:count}`.
+
+`--dry-run` computes and reports without touching anything. `--aggressive` uses a zero
+grace period and drops protection for **rejected/rolled-back** sessions older than
+`keep_rejected_sessions_days`. Accepted history is guaranteed byte-identical across gc.
+
+```yaml
+gc:
+  enabled: true
+  grace_period_days: 14
+  keep_autosaves_days: 14
+  keep_rejected_sessions_days: 30
+  quarantine: true
+  quarantine_days: 7
+  require_fsck_before_delete: true
+fsck:
+  strict: false
+  verify_seals: true
+  verify_object_hashes: true
+  verify_reachability: true
+  verify_timeline: true
+  verify_renames: true
+```
+
+### Object inspection
+
+`objects stats` (counts + bytes by type), `objects list [--reachable|--unreachable|--type]`,
+and `objects show <id>` (type, size, references, reachability, seal status) expose the store
+for operators.
+
+---
+
+## 14. Conformance
 
 An implementation conforms to Checkpoint Core Protocol 0.1 if it:
 
@@ -604,5 +696,8 @@ An implementation conforms to Checkpoint Core Protocol 0.1 if it:
 9. Detects renames natively and deterministically (exact, similar/rename+edit, directory)
    in diff, merge, and packets, bounded and configurable, without calling Git, and without
    altering content-addressed ids or seals (§4.1, §5.1).
-10. Passes the test: **with Git uninstalled, all of the above — including the autosave
-    daemon, timeline, recovery, and rename detection — still work.**
+10. Provides read-only **fsck** integrity checking and **gc** that deletes only unreachable,
+    past-grace objects, never touching reachable/accepted history, runs fsck first, and
+    quarantines before permanent deletion (§13).
+11. Passes the test: **with Git uninstalled, all of the above — including the autosave
+    daemon, timeline, recovery, rename detection, fsck, and gc — still work.**

@@ -164,6 +164,9 @@ checkpoint-core git-import ./legacy-repo # import a Git repo; Checkpoint becomes
 | `bundle export\|import` | Portable `.tar.gz` transport for offline sync. |
 | `git-export <dir>` / `git-import <dir>` | The Git bridge (the only Git-touching code). |
 | `verify-history` | Recompute SHA-256 seals across accepted history; flags tampering. |
+| `fsck [--strict --json]` | Read-only integrity check: hashes, seals, refs, trees, parents, sessions, renames. |
+| `gc [--dry-run --aggressive --force]` | Safely collect unreachable, past-grace objects (fsck-gated, quarantined). |
+| `objects stats / list [--reachable\|--unreachable\|--type] / show <id>` | Inspect the object store. |
 | `doctor` | Diagnose the installation. |
 
 ---
@@ -222,6 +225,31 @@ checkpoint-core diff --summary
 - Bounded for large changesets (`max_candidates`), and toggleable (`diff --no-renames` or
   `rename_detection.enabled: false`). Content identity stays content-addressed — rename
   metadata never changes ids or seals. See §4.1 / §5.1 of the spec.
+
+## Storage you can trust (fsck + gc)
+
+A real VCS needs storage hygiene and integrity, not just features. Checkpoint can prove
+its store is healthy and reclaim garbage without ever risking history.
+
+```bash
+checkpoint-core fsck            # is the store healthy? (read-only)
+checkpoint-core objects stats   # counts + bytes by type
+checkpoint-core gc --dry-run    # what WOULD be collected
+checkpoint-core gc              # collect unreachable, past-grace objects (safely)
+```
+
+- **fsck** walks `refs → snapshots → trees → blobs` and verifies content hashes, accepted
+  seals, tree/blob/parent references, branch/tag heads, sessions, timeline, and rename
+  records. `--strict` fails on dangling objects; `--json` is machine-readable. It is
+  **read-only** and returns a nonzero exit on corruption.
+- **gc** deletes **only** unreachable objects older than the grace period. It **never**
+  touches accepted history, branch heads, tagged snapshots, active-session objects, or
+  retained autosaves. It runs fsck first and **refuses to delete on a corrupt store**,
+  moves objects to a **quarantine** before permanent deletion (crash-safe), records a
+  ledger event, and reports bytes reclaimed. `--dry-run` changes nothing; `--aggressive`
+  shortens the grace period and drops past-retention rejected sessions.
+- **Reachability** is rebuilt from objects + refs + sessions every run — no authoritative
+  index, so a stale index can never cause data loss. See §13 of the spec.
 
 ## How it works (native objects, no Git)
 
@@ -283,7 +311,7 @@ It is a bridge for adoption, not the protocol. See
 1. **Phase 1 (done):** Checkpoint Core protocol + CLI, plus the Git adapter wedge.
 2. **Phase 2 (done):** background autosave daemon, timeline, and recovery.
 3. **Phase 3 (done):** native rename detection in diff, merge, history, and packets.
-4. **Phase 4:** object GC + `fsck` (sweep unreferenced blobs/trees; integrity check).
+4. **Phase 4 (done):** object GC + `fsck` — integrity checking and safe garbage collection.
 5. **Phase 5:** signed identity & trust (ed25519); remote protocol hardening.
 6. **Phase 6:** hosted Checkpoint service; agent integrations (Cursor, Claude Code, Codex,
    Copilot); web UI; team policy/compliance.

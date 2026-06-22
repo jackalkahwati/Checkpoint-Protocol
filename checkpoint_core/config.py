@@ -43,6 +43,23 @@ def default_config(project: str = "") -> Dict[str, Any]:
             "detect_directory_renames": True,
             "binary_exact_only": True,
         },
+        "gc": {
+            "enabled": True,
+            "grace_period_days": 14,
+            "keep_autosaves_days": 14,
+            "keep_rejected_sessions_days": 30,
+            "quarantine": True,
+            "quarantine_days": 7,
+            "require_fsck_before_delete": True,
+        },
+        "fsck": {
+            "strict": False,
+            "verify_seals": True,
+            "verify_object_hashes": True,
+            "verify_reachability": True,
+            "verify_timeline": True,
+            "verify_renames": True,
+        },
     }
 
 
@@ -103,6 +120,12 @@ class Config:
 
     def rename_detection(self) -> Dict[str, Any]:
         return self.data.get("rename_detection", {}) or {}
+
+    def gc(self) -> Dict[str, Any]:
+        return self.data.get("gc", {}) or {}
+
+    def fsck(self) -> Dict[str, Any]:
+        return self.data.get("fsck", {}) or {}
 
     def risk_rules_for(self, tags: List[str]) -> Dict[str, Any]:
         rules = self.data.get("risk_rules", {}) or {}
