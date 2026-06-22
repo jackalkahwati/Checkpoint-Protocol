@@ -96,7 +96,7 @@ async function request<T>(path: string, fallback: T, init?: RequestInit): Promis
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(init?.headers ?? {}),
       },
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(12000),
     })
 
     if (res.status === 401) {

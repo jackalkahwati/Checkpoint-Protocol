@@ -44,6 +44,20 @@ def _fsck_status(repo: Repo) -> str:
         return "warnings"
 
 
+def _fsck_status_light(repo: Repo) -> str:
+    """Cheap integrity signal for list/overview/session badges: do branch heads resolve to
+    present objects? Avoids re-hashing the whole store (full fsck runs on the Integrity page).
+    """
+    try:
+        for b in repo.list_branches():
+            h = repo.read_ref("refs/heads/{}".format(b))
+            if h and not repo.has_object(h):
+                return "warnings"
+        return "healthy"
+    except Exception:
+        return "warnings"
+
+
 def _accepted_sig_status(repo: Repo, snap_id: Optional[str]) -> str:
     if not snap_id:
         return "unsigned"
@@ -120,7 +134,7 @@ def _ui_session(repo: Repo, sess: Dict[str, Any]) -> Dict[str, Any]:
         "verification_status": (ver.get("overall") if ver else "skipped"),
         "policy_effect": _session_policy_effect(repo, sess),
         "signature_status": _accepted_sig_status(repo, accepted),
-        "fsck_status": _fsck_status(repo),
+        "fsck_status": _fsck_status_light(repo),
         "summary": sess.get("instruction", ""),
     }
 
@@ -215,7 +229,7 @@ def _repo_summary(store, owner, name, repo) -> Dict[str, Any]:
                 invalid += 1
             elif v["status"] in ("untrusted", "unknown_signer", "revoked"):
                 untrusted += 1
-    fsck = _fsck_status(repo)
+    fsck = _fsck_status_light(repo)   # cheap: dashboard/overview; full fsck on Integrity page
     sig_status = "invalid" if invalid else ("unsigned" if unsigned else "valid")
     alerts = []
     if unsigned:
