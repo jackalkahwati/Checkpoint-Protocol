@@ -99,8 +99,10 @@ A point-in-time state plus provenance. This is the unit of history.
 }
 ```
 
-- `kind` is `accepted` (canonical history), `snapshot` (meaningful intermediate), or
-  `autosave` (recovery only).
+- `kind` is `accepted` (canonical history) or `snapshot` (meaningful intermediate).
+  (Autosaves are a separate, lighter record type — see §12 — not snapshot objects. Their
+  trees are still ordinary content-addressed tree objects, so storage dedupes across all
+  three tiers.)
 - `parents` is a list (one parent normally; two for a merge; empty for the first).
 - `session` links back to the producing session object (the core object).
 - `signature` is the SHA-256 content seal (§6).
@@ -367,6 +369,12 @@ commit/snapshot ids differ because the object formats differ by design.
       instruction.txt
       packet.json
       verification/<id>.json
+      timeline.jsonl     # per-session chronological event log (§12)
+      autosaves/
+        <autosave-id>/
+          autosave.json  # autosave record (§12)
+          tree.json      # copy of the captured tree object (inspection/recovery)
+          diff.patch     # unified diff base_snapshot -> autosave tree
   ledger.jsonl           # append-only event log
   tmp/ cache/
 ```
@@ -391,7 +399,100 @@ accept, reject, rollback, branch, checkout, merge, push, pull, git_import, git_e
 
 ---
 
-## 11. Conformance
+## 12. Autosaves, the daemon, timeline, and recovery (Phase 2)
+
+The product promise: **you are never unsaved.** Git's model is "remember to commit";
+Checkpoint continuously preserves in-progress work during an active session, without ever
+polluting accepted history.
+
+### Three tiers (do not conflate)
+
+| Tier | Purpose | Becomes history? | Moves a branch? |
+|------|---------|------------------|-----------------|
+| **Autosave** | Continuous, invisible safety net for recovery | No | No |
+| **Snapshot** | User/agent-marked meaningful point for comparison | No | No |
+| **Accepted snapshot** | Official sealed history (commit equivalent) | **Yes** | **Yes** |
+
+### Autosave record schema (`autosaves/<autosave-id>/autosave.json`)
+
+```json
+{
+  "autosave_id": "auto_20260622_001144_002",
+  "session_id": "cs_...",
+  "parent_autosave_id": "auto_20260622_001144_001",
+  "timestamp": "2026-06-22T00:11:44+00:00",
+  "reason": "edit",
+  "changed_paths": ["notes.txt"],
+  "tree_id": "<tree sha256>",
+  "base_snapshot_id": "<accepted snapshot sha | null>",
+  "content_seal": "<sha256 over the fields above>",
+  "daemon_version": "0.1"
+}
+```
+
+The `content_seal` is a SHA-256 over `{autosave_id, session_id, parent_autosave_id,
+timestamp, tree_id, base_snapshot_id, changed_paths}`. It is **independent** of the
+accepted-history seal (§6); tampering with an autosave never affects `verify-history`.
+The captured `tree_id` (and its blobs) are ordinary content-addressed objects, so an
+autosave fully reconstructs the working tree and dedupes against everything else.
+
+### The daemon (`checkpoint-core watch`)
+
+A foreground file watcher for the active session:
+
+- **Polling-based** by design (reliable everywhere); native file events may be used
+  opportunistically when available. `polling_interval_ms` controls the cadence.
+- **Debounced**: an autosave is written only after the working tree has been quiet for
+  `debounce_ms`, so a burst of rapid edits collapses into one sensible autosave instead of
+  one object per keystroke.
+- **Deduplicated**: if the captured tree equals the previous autosave's tree, nothing is
+  written.
+- **Crash-safe**: each autosave is flushed to disk immediately; the watcher also writes a
+  final autosave on stop. After an editor/agent/machine failure the autosaves on disk are
+  intact.
+- **Isolated**: never creates accepted history, never moves a branch ref, never touches the
+  Git bridge, never changes snapshot seals. Works with Git uninstalled.
+- **Ignore-aware**: respects `.checkpointignore`/`.checkpoint`. Files larger than
+  `ignore_large_files_mb` are skipped to stay cheap (and are protected from deletion on
+  restore).
+
+### Timeline (`checkpoint-core timeline`)
+
+Each session has an append-only `timeline.jsonl` recording the session's story:
+`session_started`, `autosave_created`, `snapshot_created`, `verification_run`,
+`accepted`, `rollback`, `recover_invoked`. Each event is
+`{ "type", "timestamp", "payload" }`.
+
+### Recovery (`checkpoint-core recover`)
+
+Detects an interrupted session (one left active) and reports its latest autosave and
+whether the working tree has diverged from it. `--restore [--to <autosave-id>] [--yes]`
+materializes that autosave back into the working tree (protecting large skipped files).
+
+### Garbage collection
+
+Autosaves are garbage-collectable. GC removes autosave **records** beyond `gc.keep_last`
+that are also older than `gc.keep_for_days`. It never removes object-store entries or
+accepted snapshots, so history is always safe. (Unreferenced blob/tree objects can be
+swept by a separate object GC — out of scope here.)
+
+### Configuration
+
+```yaml
+autosave:
+  enabled: true
+  debounce_ms: 1000
+  max_autosaves_per_session: 500
+  ignore_large_files_mb: 50
+  polling_interval_ms: 2000
+  gc:
+    keep_last: 100
+    keep_for_days: 14
+```
+
+---
+
+## 13. Conformance
 
 An implementation conforms to Checkpoint Core Protocol 0.1 if it:
 
@@ -407,4 +508,7 @@ An implementation conforms to Checkpoint Core Protocol 0.1 if it:
    (§6).
 6. Supports content-addressed push/pull/bundle sync (§7).
 7. Provides Git import/export as an isolated bridge that the core never depends on (§8).
-8. Passes the test: **with Git uninstalled, all of the above still work.**
+8. Provides continuous, debounced, crash-safe autosaves that never become accepted
+   history and never move a branch, with timeline and recovery (§12).
+9. Passes the test: **with Git uninstalled, all of the above — including the autosave
+   daemon, timeline, and recovery — still work.**

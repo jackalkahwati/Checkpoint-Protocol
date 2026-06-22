@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import __version__, objects, util
-from . import engine, ledger as ledgermod, merge as mergemod, secrets as secretscan
+from . import autosave as autosavemod, engine, ledger as ledgermod
+from . import merge as mergemod, secrets as secretscan, timeline as timelinemod
 from . import sync as syncmod, verify as verifymod
+from .watcher import Watcher
 from .config import Config, default_config
 from .diff import tree_diff, unified
 from .ignore import DEFAULT_CHECKPOINTIGNORE
@@ -168,6 +170,8 @@ def cmd_start(args) -> int:
     repo.set_active_session(sess.id)
     ledgermod.append(repo, "session_start", sess.id, actor,
                      {"instruction": instruction, "base_tree": base_tree, "risk_tags": tags})
+    timelinemod.append(repo, sess.id, "session_started",
+                       {"instruction": instruction, "base_snapshot": sess.base_head})
 
     info(util.green("Started session ") + util.bold(sess.id))
     info("  instruction: {}".format(instruction))
@@ -187,7 +191,7 @@ def cmd_status(args) -> int:
         info("No active session on branch {}.".format(repo.head_branch() or "(detached)"))
         info("Start one with: checkpoint-core start \"<instruction>\"")
         return 0
-    engine.create_autosave(repo, sess)
+    autosavemod.create_autosave(repo, sess, reason="status")  # opportunistic safety net
     td = tree_diff(repo, sess.base_tree, scan_to_tree(repo))
     st = td["stats"]
     wt = util.yellow("dirty") if td["files"] else util.green("clean (no changes since start)")
@@ -203,7 +207,7 @@ def cmd_status(args) -> int:
         info("    {} {}".format(_status_glyph(f["status"]), f["path"]))
     autos = sess.data.get("autosaves", [])
     snaps = sess.data.get("snapshots", [])
-    info("  last autosave: {}".format(_short(autos[-1]) if autos else "(none)"))
+    info("  last autosave: {} ({} total)".format(autos[-1] if autos else "(none)", len(autos)))
     info("  last snapshot: {}".format(_short(snaps[-1]) if snaps else "(none)"))
     ver = verifymod.last_verification(repo, sess)
     info("  verification:  {}".format(ver.get("overall", "(not run)") if ver else "(not run)"))
@@ -218,6 +222,8 @@ def cmd_snapshot(args) -> int:
     snap = engine.create_snapshot(repo, sess, args.message)
     ledgermod.append(repo, "snapshot", sess.id, sess.actor(),
                      {"snapshot": snap["id"], "tree": snap["tree"], "message": args.message})
+    timelinemod.append(repo, sess.id, "snapshot_created",
+                       {"snapshot": snap["id"], "message": args.message})
     st = snap["stats"]
     info(util.green("Snapshot ") + util.bold(_short(snap["id"])))
     if args.message:
@@ -273,6 +279,8 @@ def cmd_verify(args) -> int:
         rec = verifymod.run_verification(repo, sess)
         ledgermod.append(repo, "verification", sess.id, sess.actor(),
                          {"overall": rec["overall"], "run_id": rec["verification_id"]})
+        timelinemod.append(repo, sess.id, "verification_run",
+                           {"overall": rec["overall"], "run_id": rec["verification_id"]})
         return 0
     info("Running {} verification command(s)...".format(len(cmds)))
     rec = verifymod.run_verification(repo, sess)
@@ -282,6 +290,8 @@ def cmd_verify(args) -> int:
     info("Overall: " + (util.green(rec["overall"]) if rec["overall"] == "passed" else util.red(rec["overall"])))
     ledgermod.append(repo, "verification", sess.id, sess.actor(),
                      {"overall": rec["overall"], "run_id": rec["verification_id"]})
+    timelinemod.append(repo, sess.id, "verification_run",
+                       {"overall": rec["overall"], "run_id": rec["verification_id"]})
     return 0 if rec["overall"] in ("passed", "skipped") else 1
 
 
@@ -380,6 +390,7 @@ def cmd_accept(args) -> int:
     oid = engine.accept(repo, sess, message, verification_ref)
     ledgermod.append(repo, "accept", sess.id, actor,
                      {"snapshot": oid, "message": message, "files": len(pkt["changed_files"])})
+    timelinemod.append(repo, sess.id, "accepted", {"snapshot": oid, "message": message})
 
     info(util.green("Accepted session ") + util.bold(sess.id))
     info("  snapshot: {}".format(_short(oid)))
@@ -443,6 +454,9 @@ def cmd_rollback(args) -> int:
     ledgermod.append(repo, "rollback", sess.id, sess.actor(),
                      {"target": label, "restored": len(result["restored"]),
                       "deleted": len(result["deleted"]), "pre_rollback": pre["id"]})
+    timelinemod.append(repo, sess.id, "rollback",
+                       {"target": label, "restored": len(result["restored"]),
+                        "deleted": len(result["deleted"]), "pre_rollback": pre["id"]})
     info(util.green("\nRolled back to {}".format(label)))
     info("  restored: {} files,  deleted: {} files".format(len(result["restored"]), len(result["deleted"])))
     info("  recover:  pre-rollback snapshot {}".format(_short(pre["id"])))
@@ -834,6 +848,177 @@ def _active_ok(repo: Repo) -> bool:
     return (repo.paths.session_dir(sid) / "session.json").exists()
 
 
+# ----------------------------------------------------------- watch / autosave (Phase 2)
+
+def cmd_watch(args) -> int:
+    repo = _repo()
+    sess = _active(repo)
+    if not repo.config.autosave().get("enabled", True):
+        err("autosave is disabled in config; enable autosave.enabled to watch.")
+        return 1
+    w = Watcher(repo, sess,
+                debounce_ms=args.debounce_ms, poll_ms=args.poll_ms)
+    info(util.green("Checkpoint is watching. ") + util.dim("You are never unsaved."))
+    n = w.run(log=lambda m: info(util.dim("  " + m)))
+    info("Created {} autosave(s) this run.".format(n))
+    return 0
+
+
+def cmd_autosave(args) -> int:
+    repo = _repo()
+    sub = args.autosave_cmd or "list"
+    if sub == "list":
+        sess = _active(repo)
+        recs = autosavemod.list_autosaves(repo, sess)
+        if not recs:
+            info("No autosaves yet for {}.".format(sess.id))
+            return 0
+        info(util.bold("{:<26} {:<22} {:>7} {}".format("AUTOSAVE", "WHEN", "CHANGED", "REASON")))
+        for r in recs:
+            info("{:<26} {:<22} {:>7} {}".format(
+                r["autosave_id"], r["timestamp"][:19], len(r["changed_paths"]), r.get("reason", "")))
+        return 0
+    if sub == "show":
+        sess = _active(repo)
+        rec = autosavemod.load_autosave(repo, sess, args.autosave_id)
+        if rec is None:
+            err("no such autosave: {}".format(args.autosave_id))
+            return 1
+        info(util.bold("Autosave ") + util.cyan(rec["autosave_id"]))
+        info("  session:    {}".format(rec["session_id"]))
+        info("  when:       {}".format(rec["timestamp"]))
+        info("  reason:     {}".format(rec.get("reason")))
+        info("  parent:     {}".format(rec.get("parent_autosave_id") or "(none)"))
+        info("  tree:       {}".format(_short(rec["tree_id"])))
+        info("  base:       {}".format(_short(rec.get("base_snapshot_id")) if rec.get("base_snapshot_id") else "(unborn)"))
+        info("  seal valid: {}".format(autosavemod.verify_seal(rec)))
+        info("  changed ({}):".format(len(rec["changed_paths"])))
+        for p in rec["changed_paths"][:50]:
+            info("    {}".format(p))
+        diff_path = sess.dir / "autosaves" / rec["autosave_id"] / "diff.patch"
+        if args.diff and diff_path.exists():
+            info(util.bold("\n  diff:"))
+            sys.stdout.write(diff_path.read_text(encoding="utf-8"))
+        return 0
+    if sub == "restore":
+        sess = _active(repo)
+        rec = autosavemod.load_autosave(repo, sess, args.autosave_id)
+        if rec is None:
+            err("no such autosave: {}".format(args.autosave_id))
+            return 1
+        if not confirm("Restore working tree to autosave {}?".format(args.autosave_id), args.yes):
+            info("Aborted.")
+            return 1
+        res = autosavemod.restore_autosave(repo, sess, args.autosave_id)
+        info(util.green("Restored autosave ") + util.bold(args.autosave_id))
+        info("  restored: {} files,  deleted: {} files".format(len(res["restored"]), len(res["deleted"])))
+        return 0
+    if sub == "gc":
+        sess = _active(repo)
+        removed = autosavemod.gc(repo, sess)
+        info(util.green("Garbage-collected {} autosave(s).".format(len(removed))))
+        info("  (accepted history and snapshots are never touched)")
+        return 0
+    err("unknown autosave subcommand")
+    return 2
+
+
+# ------------------------------------------------------------------------ timeline
+
+def cmd_timeline(args) -> int:
+    repo = _repo()
+    if args.session_id:
+        sid = args.session_id
+    else:
+        sess = Session.active(repo)
+        if sess is None:
+            err("no active session; pass a session id: checkpoint-core timeline <session-id>")
+            return 1
+        sid = sess.id
+    events = timelinemod.read(repo, sid)
+    if not events:
+        info("No timeline events for {}.".format(sid))
+        return 0
+    glyphs = {
+        "session_started": util.cyan("start "), "autosave_created": util.dim("auto  "),
+        "snapshot_created": util.yellow("snap  "), "verification_run": "verify",
+        "accepted": util.green("ACCEPT"), "rollback": util.red("rollbk"),
+        "recover_invoked": util.yellow("recovr"),
+    }
+    info(util.bold("Timeline for {}:".format(sid)))
+    for e in events:
+        g = glyphs.get(e["type"], e["type"][:6])
+        info("  {}  {}  {}".format(e["timestamp"][:19], g, _timeline_detail(e)))
+    return 0
+
+
+def _timeline_detail(e) -> str:
+    p = e.get("payload", {})
+    t = e["type"]
+    if t == "session_started":
+        return p.get("instruction", "")
+    if t == "autosave_created":
+        return "{} ({} changed, {})".format(p.get("autosave_id", ""), p.get("changed", 0), p.get("reason", ""))
+    if t == "snapshot_created":
+        return "{} {}".format(_short(p.get("snapshot")), p.get("message") or "")
+    if t == "verification_run":
+        return "{}".format(p.get("overall"))
+    if t == "accepted":
+        return "{} {}".format(_short(p.get("snapshot")), p.get("message") or "")
+    if t == "rollback":
+        return "to {} (restored {}, deleted {})".format(p.get("target"), p.get("restored"), p.get("deleted"))
+    if t == "recover_invoked":
+        return p.get("note", "")
+    return ""
+
+
+# ------------------------------------------------------------------------- recover
+
+def cmd_recover(args) -> int:
+    repo = _repo()
+    sess = Session.active(repo)
+    if sess is None:
+        info(util.green("No interrupted session. Nothing to recover."))
+        return 0
+
+    timelinemod.append(repo, sess.id, "recover_invoked", {"note": "recover inspected"})
+    latest = autosavemod.latest(repo, sess)
+    info(util.bold("Interrupted session: ") + util.cyan(sess.id))
+    info("  instruction: {}".format(sess.data["instruction"]))
+    info("  status:      {}".format(sess.status))
+    info("  autosaves:   {}".format(len(sess.data.get("autosaves", []))))
+    if latest is None:
+        info(util.yellow("  No autosaves were captured for this session."))
+        info("  You can continue working, or `reject` to close it.")
+        return 0
+
+    info("  latest autosave: {} ({})".format(latest["autosave_id"], latest["timestamp"][:19]))
+    current_tree = scan_to_tree(repo)
+    diverged = current_tree != latest["tree_id"]
+    if diverged:
+        td = tree_diff(repo, latest["tree_id"], current_tree)
+        info(util.yellow("  working tree DIVERGES from the latest autosave "
+                         "({} files differ).".format(td["stats"]["files_changed"])))
+    else:
+        info(util.green("  working tree matches the latest autosave."))
+
+    target = args.to or latest["autosave_id"]
+    if not args.restore:
+        info("\nOptions:")
+        info("  checkpoint-core recover --restore           # restore the latest autosave")
+        info("  checkpoint-core recover --restore --to <id> # restore a specific autosave")
+        info("  checkpoint-core autosave list               # see all autosaves")
+        return 0
+
+    if not confirm("Restore working tree to autosave {}?".format(target), args.yes):
+        info("Aborted.")
+        return 1
+    res = autosavemod.restore_autosave(repo, sess, target)
+    info(util.green("Recovered to autosave ") + util.bold(target))
+    info("  restored: {} files,  deleted: {} files".format(len(res["restored"]), len(res["deleted"])))
+    return 0
+
+
 # ------------------------------------------------------------------------ parser
 
 def build_parser() -> argparse.ArgumentParser:
@@ -967,6 +1152,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("verify-history", help="recompute and check snapshot seals").set_defaults(func=cmd_verify_history)
     sub.add_parser("doctor", help="diagnose the installation").set_defaults(func=cmd_doctor)
+
+    # --- Phase 2: background autosave daemon, timeline, recovery ---
+    sp = sub.add_parser("watch", help="continuously autosave the active session (foreground)")
+    sp.add_argument("--debounce-ms", type=int, dest="debounce_ms")
+    sp.add_argument("--poll-ms", type=int, dest="poll_ms")
+    sp.set_defaults(func=cmd_watch)
+
+    sp = sub.add_parser("autosave", help="list/show/restore/gc autosaves")
+    asub = sp.add_subparsers(dest="autosave_cmd")
+    asub.add_parser("list")
+    ashow = asub.add_parser("show")
+    ashow.add_argument("autosave_id")
+    ashow.add_argument("--diff", action="store_true", help="also print the diff")
+    arest = asub.add_parser("restore")
+    arest.add_argument("autosave_id")
+    arest.add_argument("--yes", action="store_true")
+    asub.add_parser("gc")
+    sp.set_defaults(func=cmd_autosave, autosave_cmd=None)
+
+    sp = sub.add_parser("timeline", help="show the session timeline")
+    sp.add_argument("session_id", nargs="?")
+    sp.set_defaults(func=cmd_timeline)
+
+    sp = sub.add_parser("recover", help="detect and recover an interrupted session")
+    sp.add_argument("--restore", action="store_true", help="restore the working tree")
+    sp.add_argument("--to", help="restore a specific autosave id")
+    sp.add_argument("--yes", action="store_true")
+    sp.set_defaults(func=cmd_recover)
     return p
 
 

@@ -155,6 +155,10 @@ checkpoint-core git-import ./legacy-repo # import a Git repo; Checkpoint becomes
 | `log [--status]` | Session history (active/accepted/rejected/rolled_back). |
 | `history` | Accepted-snapshot history — the commit-log equivalent. |
 | `show <session-id>` | Full session detail: snapshots, verification, ledger. |
+| `watch` | **Background autosave daemon** for the active session: continuous, debounced, crash-safe. *You are never unsaved.* |
+| `autosave list / show <id> [--diff] / restore <id> / gc` | Inspect and restore autosaves; garbage-collect old ones. |
+| `timeline [<session-id>]` | The full story of a session: start, autosaves, snapshots, verification, accept, rollback. |
+| `recover [--restore [--to <id>] --yes]` | Detect an interrupted session and restore its latest (or a chosen) autosave. |
 | `branch [<name>]` / `checkout <name>` / `merge <name>` | Native branching and line-level (diff3) three-way merge: disjoint edits auto-merge, overlapping edits conflict. |
 | `remote add <name> --location <dir>` / `push` / `pull` | Content-addressed sync between stores (server-free). |
 | `bundle export\|import` | Portable `.tar.gz` transport for offline sync. |
@@ -163,6 +167,37 @@ checkpoint-core git-import ./legacy-repo # import a Git repo; Checkpoint becomes
 | `doctor` | Diagnose the installation. |
 
 ---
+
+## You are never unsaved (the autosave daemon)
+
+Git's model is *remember to commit*. Checkpoint's model is *you are never unsaved.* During
+an active session, `checkpoint-core watch` continuously preserves your work — and an AI
+agent's work — without polluting history.
+
+```bash
+checkpoint-core start "refactor the planner"
+checkpoint-core watch &          # daemon: continuous, debounced, crash-safe autosaves
+# ... you or an agent edit for an hour: prompts, edits, retries, partial failures ...
+
+checkpoint-core autosave list    # every quiet point was captured
+checkpoint-core recover --restore --yes   # after a crash, get the work back
+checkpoint-core timeline         # the whole story: starts, autosaves, snapshots, accepts
+checkpoint-core accept -m "refactor planner"   # only this becomes sealed history
+```
+
+Three tiers, never conflated:
+
+| Tier | Purpose | Becomes history? | Moves a branch? |
+|------|---------|------------------|-----------------|
+| **Autosave** | Continuous, invisible safety net for recovery | No | No |
+| **Snapshot** | A marked meaningful point for comparison | No | No |
+| **Accepted snapshot** | Official sealed history (the commit equivalent) | **Yes** | **Yes** |
+
+The daemon is **debounced** (a burst of edits collapses into one sensible autosave),
+**deduplicated**, **crash-safe** (flushed to disk immediately; survives editor/agent/machine
+failure), **ignore-aware**, and fully **isolated** — it never creates accepted history,
+never moves a branch, never touches the Git bridge, and works with Git uninstalled. See
+§12 of the spec.
 
 ## How it works (native objects, no Git)
 
@@ -221,9 +256,10 @@ It is a bridge for adoption, not the protocol. See
 
 ## Roadmap
 
-1. **Phase 1 (this MVP):** Checkpoint Core protocol + CLI, plus the Git adapter wedge.
-2. **Phase 2:** background autosave daemon.
-3. **Phase 3:** agent integrations (Cursor, Claude Code, Codex, Copilot, local agents).
+1. **Phase 1 (done):** Checkpoint Core protocol + CLI, plus the Git adapter wedge.
+2. **Phase 2 (done):** background autosave daemon, timeline, and recovery.
+3. **Phase 3:** agent integrations (Cursor, Claude Code, Codex, Copilot, local agents);
+   rename detection for merge/diff completeness.
 4. **Phase 4:** hosted Checkpoint service (same object model and sync verbs over HTTP).
 5. **Phase 5:** web UI for sessions, diffs, prompts, verification, approvals, rollback.
 6. **Phase 6:** team workflow, policy engine, compliance, audit, enterprise controls.

@@ -31,9 +31,14 @@ def _iter_files(root: Path, ig: Ignore):
             yield rel, Path(dirpath) / fn
 
 
-def scan_to_tree(repo: Repo) -> str:
-    """Capture the working directory as a native tree object. Returns the tree id."""
+def scan_to_tree(repo: Repo, max_file_mb: Optional[float] = None) -> str:
+    """Capture the working directory as a native tree object. Returns the tree id.
+
+    max_file_mb: if set, files larger than this are skipped (used by autosave to stay
+    cheap). Skipped paths are not represented in the tree.
+    """
     ig = Ignore.load(repo.root)
+    limit = int(max_file_mb * 1024 * 1024) if max_file_mb else None
     entries: List[Dict[str, str]] = []
     for rel, abspath in _iter_files(repo.root, ig):
         if abspath.is_symlink():
@@ -43,6 +48,8 @@ def scan_to_tree(repo: Repo) -> str:
             entries.append({"path": rel, "blob": blob, "mode": "120000"})
             continue
         try:
+            if limit is not None and abspath.stat().st_size > limit:
+                continue
             data = abspath.read_bytes()
         except OSError:
             continue
@@ -53,16 +60,33 @@ def scan_to_tree(repo: Repo) -> str:
     return repo.put_object(tree)
 
 
+def large_files(repo: Repo, max_file_mb: float) -> set:
+    """Current non-ignored files exceeding the size limit (protected from deletion)."""
+    ig = Ignore.load(repo.root)
+    limit = int(max_file_mb * 1024 * 1024)
+    out = set()
+    for rel, abspath in _iter_files(repo.root, ig):
+        try:
+            if not abspath.is_symlink() and abspath.stat().st_size > limit:
+                out.add(rel)
+        except OSError:
+            pass
+    return out
+
+
 def materialize(repo: Repo, tree_id: str, delete_extra: bool = False,
-                only_paths: Optional[List[str]] = None) -> Dict[str, List[str]]:
+                only_paths: Optional[List[str]] = None,
+                protect: Optional[set] = None) -> Dict[str, List[str]]:
     """Write a tree's files into the working directory.
 
     delete_extra: remove non-ignored working files that are not in the tree.
     only_paths: if given, restrict writes/deletes to these paths.
+    protect: paths that must never be deleted (e.g. large files skipped by autosave).
     """
     tree = repo.get_object(tree_id)
     tmap = objects.tree_map(tree)
     restrict = set(only_paths) if only_paths is not None else None
+    protect = protect or set()
 
     written: List[str] = []
     for path, meta in tmap.items():
@@ -89,6 +113,8 @@ def materialize(repo: Repo, tree_id: str, delete_extra: bool = False,
         current = {rel for rel, _ in _iter_files(repo.root, ig)}
         for rel in current - set(tmap.keys()):
             if restrict is not None and rel not in restrict:
+                continue
+            if rel in protect:
                 continue
             try:
                 (repo.root / rel).unlink()

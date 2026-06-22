@@ -18,6 +18,7 @@ from .worktree import materialize, scan_to_tree
 
 def create_snapshot(repo: Repo, session: Session, message: Optional[str],
                     kind: str = objects.KIND_SNAPSHOT) -> Dict[str, Any]:
+    """Create a meaningful snapshot object (NOT an autosave). See autosave.py for autosaves."""
     tree = scan_to_tree(repo)
     snap = objects.make_snapshot(
         tree=tree, parents=[session.base_head] if session.base_head else [],
@@ -26,20 +27,9 @@ def create_snapshot(repo: Repo, session: Session, message: Optional[str],
     )
     oid = repo.put_object(snap)
     td = tree_diff(repo, session.base_tree, tree)
-    bucket = "autosaves" if kind == objects.KIND_AUTOSAVE else "snapshots"
-    session.data[bucket].append(oid)
+    session.data["snapshots"].append(oid)
     session.save()
     return {"id": oid, "tree": tree, "stats": td["stats"], "message": message}
-
-
-def create_autosave(repo: Repo, session: Session) -> Optional[Dict[str, Any]]:
-    tree = scan_to_tree(repo)
-    autos = session.data.get("autosaves", [])
-    if autos:
-        last = repo.get_object(autos[-1])
-        if last.get("tree") == tree:
-            return None  # nothing changed since last autosave
-    return create_snapshot(repo, session, "autosave", kind=objects.KIND_AUTOSAVE)
 
 
 # ----------------------------------------------------------------------- packet

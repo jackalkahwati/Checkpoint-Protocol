@@ -25,6 +25,17 @@ def default_config(project: str = "") -> Dict[str, Any]:
         },
         "secrets": {"scan": True},
         "remotes": {},  # name -> {type: path|bundle, location: ...}
+        "autosave": {
+            "enabled": True,
+            "debounce_ms": 1000,
+            "max_autosaves_per_session": 500,
+            "ignore_large_files_mb": 50,
+            "polling_interval_ms": 2000,
+            "gc": {
+                "keep_last": 100,
+                "keep_for_days": 14,
+            },
+        },
     }
 
 
@@ -79,6 +90,9 @@ class Config:
 
     def remotes(self) -> Dict[str, Any]:
         return self.data.get("remotes", {}) or {}
+
+    def autosave(self) -> Dict[str, Any]:
+        return self.data.get("autosave", {}) or {}
 
     def risk_rules_for(self, tags: List[str]) -> Dict[str, Any]:
         rules = self.data.get("risk_rules", {}) or {}
