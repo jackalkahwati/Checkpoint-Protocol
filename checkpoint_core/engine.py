@@ -55,6 +55,8 @@ def generate_packet(repo: Repo, session: Session) -> Dict[str, Any]:
     if repo.config.secrets_scan():
         findings = secretscan.scan_diff(unified(repo, base, current))
         findings += secretscan.scan_paths([f["path"] for f in changed_files])
+        findings = secretscan.filter_findings(
+            findings, secretscan.load_allow(repo.paths.base / "secrets-allow"))
 
     ver = last_verification(repo, session)
     if findings:

@@ -301,7 +301,8 @@ def _apply_ref_update(ctx, repo, owner, name, branch, old, new, fwl, uploaded=0)
         except Exception:
             changed = []
         ut = "force_with_lease" if fwl is not None else "fast_forward"
-        decision = policymod.evaluate(pol, {"operation": "push", "actor_type": "ci",
+        decision = policymod.evaluate(pol, {"operation": "push",
+                                            "actor_type": _pusher_actor_type(repo, new),
                                             "branch": branch, "changed_paths": changed,
                                             "ref_update_type": ut,
                                             "history_signed": _history_signed(repo, new)})
@@ -658,6 +659,20 @@ def _history_signed(repo, head) -> bool:
         if not signmod.signatures_for(repo, oid):
             return False
     return True
+
+
+def _pusher_actor_type(repo, snap) -> str:
+    """The actor a push represents: the type of the pushed snapshot's signer (human/agent/
+    ci/…). A hosted push transports an already-accepted snapshot, so policy should judge it
+    by who signed it, not by a hardcoded role. Falls back to 'ci' when unsigned/unknown."""
+    try:
+        for s in signmod.signatures_for(repo, snap):
+            idr = idmod.load(repo, s.get("signer_identity_id"))
+            if idr and idr.get("type"):
+                return idr["type"]
+    except Exception:
+        pass
+    return "ci"
 
 
 def _record_server_policy(repo, decision):

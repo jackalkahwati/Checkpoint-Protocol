@@ -5,10 +5,23 @@ export bundles so secret *values* do not leave the local recovery store.
 """
 from __future__ import annotations
 
+import fnmatch
 import re
+from pathlib import Path
 from typing import Dict, List
 
 REDACTION = "***REDACTED***"
+
+DEFAULT_ALLOW_TEMPLATE = """\
+# .checkpoint/secrets-allow — paths where secret findings are known false positives
+# (e.g. test fixtures, docs with example credentials). gitignore-style globs, one per line.
+# Lines beginning with '#' are comments. Use sparingly; this disables secret detection
+# for the matched paths only.
+# Examples:
+# tests/
+# docs/
+# path/to/example.py
+"""
 
 # (type, compiled regex). Patterns aim for high-signal, low-noise matches.
 _PATTERNS = [
@@ -83,3 +96,39 @@ def redact(text: str) -> str:
     for _kind, rx in _PATTERNS:
         out = rx.sub(REDACTION, out)
     return out
+
+
+# ----------------------------------------------------------------- allowlist
+
+def load_allow(allow_file: Path) -> List[str]:
+    """Read gitignore-style path globs from a `secrets-allow` file (missing -> [])."""
+    f = Path(allow_file)
+    if not f.exists():
+        return []
+    out = []
+    for raw in f.read_text(encoding="utf-8").splitlines():
+        p = raw.strip()
+        if p and not p.startswith("#"):
+            out.append(p.rstrip("/"))
+    return out
+
+
+def _path_allowed(path: str, globs: List[str]) -> bool:
+    rel = str(path).replace("\\", "/")
+    segments = rel.split("/")
+    for g in globs:
+        g = g.rstrip("/")                                   # tolerate "tests/" and "tests"
+        if g in segments:                                   # directory name anywhere
+            return True
+        if fnmatch.fnmatch(rel, g) or fnmatch.fnmatch(rel, g + "/*"):
+            return True
+        if fnmatch.fnmatch(segments[-1], g):                # basename glob (e.g. *.test.py)
+            return True
+    return False
+
+
+def filter_findings(findings: List[Dict[str, object]], globs: List[str]) -> List[Dict[str, object]]:
+    """Drop findings whose file matches an allowlist glob."""
+    if not globs:
+        return findings
+    return [f for f in findings if not _path_allowed(str(f.get("file", "")), globs)]

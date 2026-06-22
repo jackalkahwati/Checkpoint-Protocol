@@ -555,10 +555,13 @@ def cmd_accept(args) -> int:
         findings = secretscan.scan_diff(unified(repo, sess.base_tree, current))
         td = tree_diff(repo, sess.base_tree, current)
         findings += secretscan.scan_paths([f["path"] for f in td["files"]])
+        findings = secretscan.filter_findings(
+            findings, secretscan.load_allow(repo.paths.base / "secrets-allow"))
         if findings and not args.force:
             err("possible secrets detected in the changes. Refusing to accept.")
             for f in findings[:20]:
                 info(util.red("  {} ({}:{})".format(f["type"], f["file"], f["line"])))
+            info(util.dim("  false positives? add the path to .checkpoint/secrets-allow, or use --force"))
             return 1
 
     pkt = engine.generate_packet(repo, sess)
@@ -908,7 +911,8 @@ def cmd_remote(args) -> int:
             return 1
         info(util.bold("Remote ") + util.cyan(args.name))
         info("  type: {}".format(spec.get("type")))
-        info("  path: {}".format(spec.get("path")))
+        info("  {}: {}".format("url" if spec.get("type") == "http" else "path",
+                               spec.get("url") or spec.get("path")))
         try:
             st = remotemod.sync_status(repo, args.name)
             for b in st["branches"]:
@@ -921,7 +925,7 @@ def cmd_remote(args) -> int:
         info("No remotes. Add one: checkpoint-core remote add <name> --type filesystem --path <dir>")
         return 0
     for name, spec in remotes.items():
-        info("{:<16} {}: {}".format(name, spec.get("type"), spec.get("path")))
+        info("{:<16} {}: {}".format(name, spec.get("type"), spec.get("url") or spec.get("path")))
     return 0
 
 
@@ -1040,8 +1044,12 @@ def cmd_push(args) -> int:
         err("--force-with-lease rejected: remote moved (expected {}, found {}).".format(
             _short(res.get("expected")), _short(res.get("remote_head"))))
         return 1
-    info(util.yellow("push: {}".format(status)))
-    return 0
+    reasons = res.get("reasons") or []
+    actions = res.get("required_actions") or []
+    err("push failed ({}){}".format(status, ": " + "; ".join(reasons) if reasons else ""))
+    for a in actions:
+        info(util.dim("  - " + a))
+    return 1
 
 
 def cmd_clone(args) -> int:
