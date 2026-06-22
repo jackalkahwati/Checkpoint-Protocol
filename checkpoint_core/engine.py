@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from . import objects, util
 from . import secrets as secretscan
-from .diff import tree_diff, unified
+from .diff import diff_result, tree_diff, unified
 from .session import Session, ACCEPTED, REJECTED, ROLLED_BACK
 from .store import Repo
 from .verify import last_verification
@@ -42,19 +42,26 @@ def _recommended_message(session: Session) -> str:
 def generate_packet(repo: Repo, session: Session) -> Dict[str, Any]:
     base = session.base_tree
     current = scan_to_tree(repo)
-    td = tree_diff(repo, base, current)
+    dr = diff_result(repo, base, current)
+    changed_files = (
+        [{"path": p, "status": "added"} for p in dr["added"]]
+        + [{"path": p, "status": "deleted"} for p in dr["deleted"]]
+        + [{"path": p, "status": "modified"} for p in dr["modified"]]
+        + [{"path": r["new_path"], "status": "renamed", "from": r["old_path"],
+            "similarity": r["similarity"], "kind": r["kind"]} for r in dr["renamed"]]
+    )
 
     findings: List[Dict[str, Any]] = []
     if repo.config.secrets_scan():
         findings = secretscan.scan_diff(unified(repo, base, current))
-        findings += secretscan.scan_paths([f["path"] for f in td["files"]])
+        findings += secretscan.scan_paths([f["path"] for f in changed_files])
 
     ver = last_verification(repo, session)
     if findings:
         next_action = "review-secrets"
     elif ver.get("overall") == "failed":
         next_action = "fix-verification"
-    elif not td["files"]:
+    elif not changed_files:
         next_action = "rollback-or-close"
     else:
         next_action = "accept"
@@ -71,8 +78,10 @@ def generate_packet(repo: Repo, session: Session) -> Dict[str, Any]:
         "base_snapshot": session.base_head,
         "base_tree": base,
         "current_tree": current,
-        "changed_files": [{"path": f["path"], "status": f["status"]} for f in td["files"]],
-        "stats": td["stats"],
+        "changed_files": changed_files,
+        "rename_records": dr["renamed"],
+        "directory_renames": dr["directory_renames"],
+        "stats": dr["stats"],
         "diff_ref": "checkpoint-core diff",
         "snapshots": session.data.get("snapshots", []),
         "verification": {"overall": ver.get("overall", "not-run"),

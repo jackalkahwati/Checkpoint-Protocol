@@ -36,6 +36,13 @@ def default_config(project: str = "") -> Dict[str, Any]:
                 "keep_for_days": 14,
             },
         },
+        "rename_detection": {
+            "enabled": True,
+            "similarity_threshold": 0.60,
+            "max_candidates": 10000,
+            "detect_directory_renames": True,
+            "binary_exact_only": True,
+        },
     }
 
 
@@ -93,6 +100,9 @@ class Config:
 
     def autosave(self) -> Dict[str, Any]:
         return self.data.get("autosave", {}) or {}
+
+    def rename_detection(self) -> Dict[str, Any]:
+        return self.data.get("rename_detection", {}) or {}
 
     def risk_rules_for(self, tags: List[str]) -> Dict[str, Any]:
         rules = self.data.get("risk_rules", {}) or {}

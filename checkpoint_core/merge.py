@@ -166,50 +166,145 @@ def _merge_file(repo: Repo, base_blob: Optional[str], ours_blob: Optional[str],
             "blob": blob_id, "reason": "auto-merged"}
 
 
-# ----------------------------------------------------------------- top level
+def _merge_content(repo: Repo, base_blob: Optional[str], ours_blob: Optional[str],
+                   theirs_blob: Optional[str]) -> Dict[str, Any]:
+    """Three-way content merge. Returns {conflict, blob, content}."""
+    if ours_blob == theirs_blob:
+        return {"conflict": False, "blob": ours_blob, "content": None}
+    if base_blob is not None and ours_blob == base_blob:
+        return {"conflict": False, "blob": theirs_blob, "content": None}
+    if base_blob is not None and theirs_blob == base_blob:
+        return {"conflict": False, "blob": ours_blob, "content": None}
+    res = _merge_file(repo, base_blob, ours_blob, theirs_blob)
+    if res["conflict"]:
+        return {"conflict": True, "blob": None, "content": res["content"]}
+    return {"conflict": False, "blob": res["blob"], "content": res["content"]}
+
+
+# ----------------------------------------------------------------- top level (rename-aware)
 
 def three_way(repo: Repo, ours_tree: Optional[str], theirs_tree: Optional[str],
-              base_tree: Optional[str]) -> Dict[str, Any]:
+              base_tree: Optional[str], opts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    from . import rename as renamemod
     ours = _tmap(repo, ours_tree)
     theirs = _tmap(repo, theirs_tree)
     base = _tmap(repo, base_tree)
 
-    all_paths = sorted(set(ours) | set(theirs) | set(base))
-    entries: List[Dict[str, str]] = []
+    rn_opts = opts if opts is not None else renamemod.options(repo)
+    ours_recs = renamemod.detect_between(repo, base, ours, rn_opts) if rn_opts.get("enabled") else []
+    theirs_recs = renamemod.detect_between(repo, base, theirs, rn_opts) if rn_opts.get("enabled") else []
+    ours_rn = {r["old_path"]: r for r in ours_recs}
+    theirs_rn = {r["old_path"]: r for r in theirs_recs}
+
+    entries: Dict[str, Dict[str, str]] = {}
     conflicts: List[str] = []
     conflict_files: Dict[str, bytes] = {}
     auto_merged: List[str] = []
+    applied_renames: List[Dict[str, Any]] = []
+    used_ours: set = set()
+    used_theirs: set = set()
 
-    for path in all_paths:
-        o = _blob_or_none(ours, path)
-        t = _blob_or_none(theirs, path)
-        b = _blob_or_none(base, path)
+    def mode_for(path: str) -> str:
+        for m in (ours, theirs, base):
+            if path in m:
+                return m[path].get("mode", "100644")
+        return "100644"
 
-        if o == t:
-            chosen = o
-        elif o == b:
-            chosen = t
-        elif t == b:
-            chosen = o
-        else:
-            res = _merge_file(repo, b, o, t)
-            if res["conflict"]:
+    def resolve(side_map, rn, b):
+        if b in rn:
+            p = rn[b]["new_path"]
+            return p, side_map.get(p, {}).get("blob")
+        if b in side_map:
+            return b, side_map[b]["blob"]
+        return None, None
+
+    def set_entry(path, blob):
+        if path in entries and entries[path]["blob"] != blob:
+            if path not in conflicts:
                 conflicts.append(path)
-                conflict_files[path] = res["content"]
-                continue
-            chosen = res["blob"]
-            auto_merged.append(path)
+            return
+        entries[path] = {"path": path, "blob": blob, "mode": mode_for(path)}
 
-        if chosen is not None:
-            mode = (ours.get(path) or theirs.get(path) or base.get(path) or {}).get("mode", "100644")
-            entries.append({"path": path, "blob": chosen, "mode": mode})
+    def keep(path, blob, reason):
+        if path not in conflicts:
+            conflicts.append(path)
+        if blob is not None and path:
+            conflict_files[path] = repo.get_blob(blob)
+
+    # 1) every file that existed in base, tracked by identity (its base path)
+    for b in sorted(base):
+        base_blob = base[b]["blob"]
+        op, ob = resolve(ours, ours_rn, b)
+        tp, tb = resolve(theirs, theirs_rn, b)
+        if op is not None:
+            used_ours.add(op)
+        if tp is not None:
+            used_theirs.add(tp)
+        ours_moved = op is not None and op != b
+        theirs_moved = tp is not None and tp != b
+
+        if op is None and tp is None:
+            continue  # deleted on both sides
+        if op is None:  # ours deleted
+            if theirs_moved or tb != base_blob:
+                keep(tp, tb, "delete/rename-or-modify")
+            continue
+        if tp is None:  # theirs deleted
+            if ours_moved or ob != base_blob:
+                keep(op, ob, "rename-or-modify/delete")
+            continue
+        if ours_moved and theirs_moved and op != tp:
+            # both renamed the same origin to different paths -> rename conflict
+            if b not in conflicts:
+                conflicts.append(b)
+            conflict_files[op] = repo.get_blob(ob)
+            conflict_files[tp] = repo.get_blob(tb)
+            continue
+
+        final_path = op if ours_moved else (tp if theirs_moved else b)
+        if ours_moved:
+            applied_renames.append({**ours_rn[b], "side": "ours", "final_path": final_path})
+        elif theirs_moved:
+            applied_renames.append({**theirs_rn[b], "side": "theirs", "final_path": final_path})
+
+        merged = _merge_content(repo, base_blob, ob, tb)
+        if merged["conflict"]:
+            if final_path not in conflicts:
+                conflicts.append(final_path)
+            conflict_files[final_path] = merged["content"]
+        else:
+            if ob != tb and ob != base_blob and tb != base_blob:
+                auto_merged.append(final_path)
+            set_entry(final_path, merged["blob"])
+
+    # 2) files with no base origin (genuine adds on either side)
+    ours_adds = {p for p in ours if p not in base and p not in used_ours}
+    theirs_adds = {p for p in theirs if p not in base and p not in used_theirs}
+    for p in sorted(ours_adds | theirs_adds):
+        ob = ours[p]["blob"] if p in ours_adds else None
+        tb = theirs[p]["blob"] if p in theirs_adds else None
+        if ob is not None and tb is not None:
+            merged = _merge_content(repo, None, ob, tb)
+            if merged["conflict"]:
+                if p not in conflicts:
+                    conflicts.append(p)
+                conflict_files[p] = merged["content"]
+            else:
+                if ob != tb:
+                    auto_merged.append(p)
+                set_entry(p, merged["blob"])
+        elif ob is not None:
+            set_entry(p, ob)
+        else:
+            set_entry(p, tb)
 
     clean = not conflicts
-    merged_tree_id = repo.put_object(objects.make_tree(entries)) if clean else None
+    merged_tree_id = repo.put_object(objects.make_tree(list(entries.values()))) if clean else None
     return {
         "clean": clean,
-        "conflicts": conflicts,
+        "conflicts": sorted(set(conflicts)),
         "conflict_files": conflict_files,
-        "auto_merged": auto_merged,
+        "auto_merged": sorted(set(auto_merged)),
         "merged_tree": merged_tree_id,
+        "rename_records": applied_renames,
     }

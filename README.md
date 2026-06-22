@@ -146,7 +146,7 @@ checkpoint-core git-import ./legacy-repo # import a Git repo; Checkpoint becomes
 | `start "<instruction>"` | Start a session; baseline = current branch head. Flags: `--tag`, `--agent`, `--model`, `--tool`, `--actor`. |
 | `status` | Active session, changed files vs head, last autosave/snapshot, verification. |
 | `snapshot [-m]` | Capture a meaningful intermediate snapshot (a native object). |
-| `diff [--summary --files --from --to]` | Native diff (tree diff + unified content diff), no Git. |
+| `diff [--summary --files --from --to --no-renames]` | Rename-aware native diff (tree + unified content diff), no Git. |
 | `verify` | Run configured verification commands; store the record. |
 | `packet [--json]` | Generate a Change Packet (diff, snapshots, verification, risks, recommendation). |
 | `accept [-m --no-verify --force]` | Create an **accepted snapshot**, advance the branch, seal it. Native history. |
@@ -198,6 +198,30 @@ The daemon is **debounced** (a burst of edits collapses into one sensible autosa
 failure), **ignore-aware**, and fully **isolated** — it never creates accepted history,
 never moves a branch, never touches the Git bridge, and works with Git uninstalled. See
 §12 of the spec.
+
+## Renames survive (refactor-friendly review)
+
+AI agents move files, split modules, rename components, and reorganize folders constantly.
+Without rename detection that all reads as `delete + add` and review quality collapses.
+Checkpoint detects renames natively — in diff, merge, and packets — so an AI refactor
+reviews as clean logical change.
+
+```bash
+mv lib/parser.py core/tokenizer.py     # move + rename
+checkpoint-core diff --summary
+#  R  lib/parser.py -> core/tokenizer.py (100%)
+#  dir  lib -> core (3 files)
+```
+
+- **Exact** (identical content, text or binary), **rename + edit** (similarity ≥ threshold,
+  shown as a rename *with* its content diff), and **directory renames** (a consistent prefix
+  move) — all deterministic, all configurable, none calling Git.
+- **Rename-aware merge**: if one branch renames a file and another edits it, the edits land
+  on the renamed file. Both-rename-to-different-paths and rename/delete are reported as
+  conflicts without losing work.
+- Bounded for large changesets (`max_candidates`), and toggleable (`diff --no-renames` or
+  `rename_detection.enabled: false`). Content identity stays content-addressed — rename
+  metadata never changes ids or seals. See §4.1 / §5.1 of the spec.
 
 ## How it works (native objects, no Git)
 
@@ -258,8 +282,11 @@ It is a bridge for adoption, not the protocol. See
 
 1. **Phase 1 (done):** Checkpoint Core protocol + CLI, plus the Git adapter wedge.
 2. **Phase 2 (done):** background autosave daemon, timeline, and recovery.
-3. **Phase 3:** agent integrations (Cursor, Claude Code, Codex, Copilot, local agents);
-   rename detection for merge/diff completeness.
+3. **Phase 3 (done):** native rename detection in diff, merge, history, and packets.
+4. **Phase 4:** object GC + `fsck` (sweep unreferenced blobs/trees; integrity check).
+5. **Phase 5:** signed identity & trust (ed25519); remote protocol hardening.
+6. **Phase 6:** hosted Checkpoint service; agent integrations (Cursor, Claude Code, Codex,
+   Copilot); web UI; team policy/compliance.
 4. **Phase 4:** hosted Checkpoint service (same object model and sync verbs over HTTP).
 5. **Phase 5:** web UI for sessions, diffs, prompts, verification, approvals, rollback.
 6. **Phase 6:** team workflow, policy engine, compliance, audit, enterprise controls.

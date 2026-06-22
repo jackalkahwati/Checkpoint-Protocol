@@ -89,6 +89,99 @@ def _line_counts(repo: Repo, a_blob: Optional[str], b_blob: Optional[str]):
     return (ins, dele)
 
 
+def diff_result(repo: Repo, a_tree: Optional[str], b_tree: Optional[str],
+                detect_renames: bool = True) -> Dict[str, Any]:
+    """Rename-aware structured diff. Returns added/deleted/modified/renamed + stats."""
+    from . import rename as renamemod
+    a = _tmap(repo, a_tree)
+    b = _tmap(repo, b_tree)
+    a_paths, b_paths = set(a), set(b)
+    raw_added = b_paths - a_paths
+    raw_deleted = a_paths - b_paths
+    common = a_paths & b_paths
+    modified = sorted(p for p in common if a[p]["blob"] != b[p]["blob"])
+
+    rename_records: List[Dict[str, Any]] = []
+    added = sorted(raw_added)
+    deleted = sorted(raw_deleted)
+    if detect_renames:
+        opts = renamemod.options(repo)
+        rename_records, added, deleted = renamemod.detect(
+            repo,
+            {p: a[p]["blob"] for p in raw_deleted},
+            {p: b[p]["blob"] for p in raw_added},
+            opts,
+        )
+
+    ins = dele = 0
+    for p in modified:
+        i, d = _line_counts(repo, a[p]["blob"], b[p]["blob"])
+        ins += i
+        dele += d
+    for p in added:
+        i, _ = _line_counts(repo, None, b[p]["blob"])
+        ins += i
+    for p in deleted:
+        _, d = _line_counts(repo, a[p]["blob"], None)
+        dele += d
+    for r in rename_records:
+        if r["old_blob_id"] != r["new_blob_id"]:
+            i, d = _line_counts(repo, r["old_blob_id"], r["new_blob_id"])
+            ins += i
+            dele += d
+
+    files_changed = len(added) + len(deleted) + len(modified) + len(rename_records)
+    return {
+        "added": added,
+        "deleted": deleted,
+        "modified": modified,
+        "renamed": rename_records,
+        "directory_renames": renamemod.directory_summary(rename_records) if detect_renames else [],
+        "stats": {"files_changed": files_changed, "insertions": ins, "deletions": dele},
+    }
+
+
+def unified_result(repo: Repo, a_tree: Optional[str], b_tree: Optional[str],
+                   detect_renames: bool = True) -> str:
+    """Rename-aware unified diff text (rename headers + content diffs for rename+edit)."""
+    dr = diff_result(repo, a_tree, b_tree, detect_renames)
+    out: List[str] = []
+    a = _tmap(repo, a_tree)
+    b = _tmap(repo, b_tree)
+    for r in dr["renamed"]:
+        pct = int(round(r["similarity"] * 100))
+        out.append("rename {} => {} ({}%, {})\n".format(
+            r["old_path"], r["new_path"], pct, r["kind"]))
+        if r["old_blob_id"] != r["new_blob_id"]:
+            al = _decode(repo, r["old_blob_id"])
+            bl = _decode(repo, r["new_blob_id"])
+            if al is None or bl is None:
+                out.append("# binary content changed\n")
+            else:
+                out.append("".join(difflib.unified_diff(
+                    al, bl, fromfile="a/" + r["old_path"], tofile="b/" + r["new_path"])))
+    for p in dr["modified"]:
+        al = _decode(repo, a[p]["blob"])
+        bl = _decode(repo, b[p]["blob"])
+        if al is None or bl is None:
+            out.append("# binary file changed: {}\n".format(p))
+        else:
+            out.append("".join(difflib.unified_diff(al, bl, fromfile="a/" + p, tofile="b/" + p)))
+    for p in dr["added"]:
+        bl = _decode(repo, b[p]["blob"])
+        if bl is None:
+            out.append("# binary file added: {}\n".format(p))
+        else:
+            out.append("".join(difflib.unified_diff([], bl, fromfile="/dev/null", tofile="b/" + p)))
+    for p in dr["deleted"]:
+        al = _decode(repo, a[p]["blob"])
+        if al is None:
+            out.append("# binary file deleted: {}\n".format(p))
+        else:
+            out.append("".join(difflib.unified_diff(al, [], fromfile="a/" + p, tofile="/dev/null")))
+    return "".join(out)
+
+
 def unified(repo: Repo, a_tree: Optional[str], b_tree: Optional[str]) -> str:
     """Unified-diff text for all changed files between two trees."""
     td = tree_diff(repo, a_tree, b_tree)

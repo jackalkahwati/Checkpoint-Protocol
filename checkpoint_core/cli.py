@@ -17,7 +17,7 @@ from . import merge as mergemod, secrets as secretscan, timeline as timelinemod
 from . import sync as syncmod, verify as verifymod
 from .watcher import Watcher
 from .config import Config, default_config
-from .diff import tree_diff, unified
+from .diff import diff_result, tree_diff, unified, unified_result
 from .ignore import DEFAULT_CHECKPOINTIGNORE
 from .session import Session, ACCEPTED, REJECTED, ROLLED_BACK
 from .store import CORE_DIR, NotInitialized, Repo
@@ -246,23 +246,34 @@ def cmd_diff(args) -> int:
 
     base = tree_for(args.from_snapshot, sess.base_tree)
     target = tree_for(args.to_snapshot, None) if args.to_snapshot else scan_to_tree(repo)
+    detect = not args.no_renames
 
-    if args.summary:
-        td = tree_diff(repo, base, target)
-        if not td["files"]:
+    if args.summary or args.files:
+        dr = diff_result(repo, base, target, detect_renames=detect)
+        rows = (
+            [("renamed", "{} -> {} ({}%)".format(r["old_path"], r["new_path"],
+                                                 int(round(r["similarity"] * 100))))
+             for r in dr["renamed"]]
+            + [("added", p) for p in dr["added"]]
+            + [("modified", p) for p in dr["modified"]]
+            + [("deleted", p) for p in dr["deleted"]]
+        )
+        if not rows:
             info("no changes")
-        for f in td["files"]:
-            info(" {}  {}".format(_status_glyph(f["status"]), f["path"]))
-        s = td["stats"]
-        info(" {} files changed, +{} -{}".format(s["files_changed"], s["insertions"], s["deletions"]))
-    elif args.files:
-        td = tree_diff(repo, base, target)
-        if not td["files"]:
-            info("no changes")
-        for f in td["files"]:
-            info("{}\t{}".format(f["status"], f["path"]))
+        for status, label in rows:
+            if args.files:
+                info("{}\t{}".format(status, label))
+            else:
+                info(" {}  {}".format(_status_glyph(status), label))
+        if args.summary:
+            s = dr["stats"]
+            info(" {} files changed, +{} -{}".format(
+                s["files_changed"], s["insertions"], s["deletions"]))
+            if dr["directory_renames"]:
+                for d in dr["directory_renames"]:
+                    info(" dir  {} -> {} ({} files)".format(d["old_dir"] or ".", d["new_dir"] or ".", d["count"]))
     else:
-        out = unified(repo, base, target)
+        out = unified_result(repo, base, target, detect_renames=detect)
         sys.stdout.write(out if out.strip() else "no changes\n")
     return 0
 
@@ -316,7 +327,12 @@ def cmd_packet(args) -> int:
     s = pkt["stats"]
     info("  summary:     {} files, +{} -{}".format(s["files_changed"], s["insertions"], s["deletions"]))
     for f in pkt["changed_files"][:50]:
-        info("    {} {}".format(_status_glyph(f["status"]), f["path"]))
+        if f["status"] == "renamed":
+            info("    {} {} -> {} ({}%)".format(
+                _status_glyph("renamed"), f.get("from"), f["path"],
+                int(round(f.get("similarity", 1.0) * 100))))
+        else:
+            info("    {} {}".format(_status_glyph(f["status"]), f["path"]))
     info("  snapshots:   {}".format(len(pkt["snapshots"])))
     info("  verification: {}".format(pkt["verification"]["overall"]))
     info("  risks:       {}".format(", ".join(pkt["risks"])))
@@ -648,6 +664,9 @@ def cmd_merge(args) -> int:
                      {"into": branch, "from": args.name, "type": "three-way",
                       "head": oid, "auto_merged": len(result["auto_merged"])})
     info(util.green("Merged ") + "{} into {} ({})".format(args.name, branch, _short(oid)))
+    if result.get("rename_records"):
+        for r in result["rename_records"]:
+            info("  renamed ({}): {} -> {}".format(r["side"], r["old_path"], r["final_path"]))
     if result["auto_merged"]:
         info("  auto-merged (line-level): {}".format(", ".join(result["auto_merged"])))
     return 0
@@ -1062,6 +1081,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--to", dest="to_snapshot")
     sp.add_argument("--summary", action="store_true")
     sp.add_argument("--files", action="store_true")
+    sp.add_argument("--no-renames", action="store_true", help="disable rename detection")
     sp.set_defaults(func=cmd_diff)
 
     sub.add_parser("verify", help="run verification commands").set_defaults(func=cmd_verify)

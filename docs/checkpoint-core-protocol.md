@@ -234,6 +234,72 @@ Checkpoint does not depend on `git diff`. Diffs are computed natively:
   content diff) is the native diff format. It is human-readable and tool-parseable, and
   can be rendered to Git's patch format by the bridge if needed.
 
+### 4.1 Rename detection
+
+A naive diff reports a moved file as `deleted old` + `added new`. AI agents move, split,
+and reorganize files constantly, so Checkpoint detects renames natively (no Git) and
+reports them as a single change. Detection is **deterministic** and **configurable**.
+
+The rename-aware **DiffResult** is:
+
+```json
+{
+  "added":    ["..."],
+  "deleted":  ["..."],
+  "modified": ["..."],
+  "renamed":  [ RenameRecord, ... ],
+  "directory_renames": [ { "old_dir": "lib", "new_dir": "core", "count": 3 } ],
+  "stats": { "files_changed": N, "insertions": I, "deletions": D }
+}
+```
+
+A **RenameRecord** is:
+
+```json
+{
+  "old_path": "lib/parser.py",
+  "new_path": "core/tokenizer.py",
+  "similarity": 1.0,
+  "old_blob_id": "<sha256>",
+  "new_blob_id": "<sha256>",
+  "kind": "exact",          // exact | similar | rename_edit | directory
+  "confidence": 1.0,
+  "detected_at": "..."
+}
+```
+
+**Algorithm** (over the raw added/deleted sets):
+
+1. **Exact** — match a deleted path to an added path with the **same blob id**
+   (`similarity = 1.0`). Works for text *and* binary. Greedy, deterministic tie-break by
+   path.
+2. **Similar / rename+edit** (text only) — for the remaining text files, compute a
+   deterministic line-similarity with `difflib.SequenceMatcher.ratio()` (gated by the
+   cheap `real_quick_ratio`/`quick_ratio` prefilters). Pairs scoring ≥
+   `similarity_threshold` are matched best-first (greedy, deterministic tie-break). A
+   matched pair with content changes is `rename_edit`; the unified diff shows the content
+   change. **Binary files are never similarity-matched** (`binary_exact_only`).
+3. **Directory rename** — from the matches found, learn `old_dir → new_dir` prefix moves
+   that recur (≥ 2 files); reclassify those records as `directory`, and sweep any remaining
+   same-basename files under a trusted mapping (covers files too edited to pass the
+   content threshold).
+
+**Bounding cost**: if `|deleted| × |added| > max_candidates`, the O(n·m) similarity pass is
+skipped (exact + directory detection still run), so large changesets never explode.
+Rename detection is disabled with `rename_detection.enabled: false` (or `diff --no-renames`).
+
+```yaml
+rename_detection:
+  enabled: true
+  similarity_threshold: 0.60
+  max_candidates: 10000
+  detect_directory_renames: true
+  binary_exact_only: true
+```
+
+Rename detection improves review and merge; **content identity remains content-addressed**
+(it never changes blob/tree/snapshot ids or seals).
+
 ---
 
 ## 5. Branch and merge
@@ -260,8 +326,33 @@ Checkpoint does not depend on `git diff`. Diffs are computed natively:
     then `start` + `accept` records the merge).
 
   diff3 synchronizes on lines common to all three versions (base ∩ ours ∩ theirs) and
-  classifies the regions between those anchors. Semantic / AST-aware merge and rename
-  detection are intentionally out of scope for this version.
+  classifies the regions between those anchors. Semantic / AST-aware merge is intentionally
+  out of scope for this version.
+
+### 5.1 Rename-aware merge
+
+Merge is **identity-based**: each file that existed in the merge base is tracked by its
+**base path** even if one or both sides renamed it. The merge detects renames on each side
+(base→ours, base→theirs, §4.1), resolves the file's final path, then performs a line-level
+content merge of the base/ours/theirs contents at that identity. **MergeResult** is
+`{ merged_tree_id, conflicts, rename_records, auto_merged }`.
+
+| Case | Result |
+|------|--------|
+| ours renames, theirs unchanged | file at ours' new path |
+| ours unchanged, theirs renames | file at theirs' new path |
+| ours renames, theirs edits original | renamed file with theirs' edits applied (line-level merge at the new path) |
+| both rename to the **same** path | one file at that path; contents line-merged if both edited |
+| both rename the same origin to **different** paths | **rename conflict** — both versions materialized at their respective paths; no merge snapshot |
+| ours deletes, theirs renames (or vice-versa) | **rename/delete conflict** — surviving content preserved on disk |
+| directory rename on one side, file edits on the other | files land at the moved paths with edits applied where the line merge succeeds |
+
+**Conflict layout**: content conflicts use inline diff3 markers (§5). Path conflicts
+(rename/rename to different paths, rename/delete) are reported structurally and the
+involved file versions are materialized at their natural paths so no work is lost; the
+merge produces no accepted snapshot until the user resolves and accepts. Rename detection
+in merge is bounded and configurable exactly as in §4.1, and never alters accepted-snapshot
+seals (the merge snapshot is sealed normally over its merged tree).
 
 ---
 
@@ -510,5 +601,8 @@ An implementation conforms to Checkpoint Core Protocol 0.1 if it:
 7. Provides Git import/export as an isolated bridge that the core never depends on (§8).
 8. Provides continuous, debounced, crash-safe autosaves that never become accepted
    history and never move a branch, with timeline and recovery (§12).
-9. Passes the test: **with Git uninstalled, all of the above — including the autosave
-   daemon, timeline, and recovery — still work.**
+9. Detects renames natively and deterministically (exact, similar/rename+edit, directory)
+   in diff, merge, and packets, bounded and configurable, without calling Git, and without
+   altering content-addressed ids or seals (§4.1, §5.1).
+10. Passes the test: **with Git uninstalled, all of the above — including the autosave
+    daemon, timeline, recovery, and rename detection — still work.**
