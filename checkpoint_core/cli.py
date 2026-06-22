@@ -71,6 +71,16 @@ def _status_glyph(s: str) -> str:
 
 def cmd_init(args) -> int:
     root = Path.cwd()
+    if getattr(args, "safe_git_adapter", False) and (root / ".git").exists():
+        info(util.yellow("Safe mode for an existing Git repo:"))
+        info("  Checkpoint Core will NOT modify Git history or your files.")
+        info("  Recommended safe trial:")
+        info("    1) checkpoint-core init            # creates .checkpoint/ (Git untouched)")
+        info("    2) checkpoint-core git-import .     # import Git history into Checkpoint (read-only on Git)")
+        info("    3) checkpoint-core start \"safe experiment\"")
+        info("  Git stays the source of truth until you choose Checkpoint Core. The")
+        info("  `checkpoint` Git ADAPTER remains available as an adoption wedge.")
+        info("")
     repo = Repo(root)
     p = repo.paths
     if p.config.exists() and not args.force:
@@ -1238,11 +1248,13 @@ def cmd_verify_history(args) -> int:
 # ------------------------------------------------------------------------ doctor
 
 def cmd_doctor(args) -> int:
-    problems = 0
     try:
         repo = Repo.discover()
     except NotInitialized:
-        err("not inside a Checkpoint Core repo. Run `checkpoint-core init`.")
+        if getattr(args, "json", False):
+            print(_dump({"ok": False, "error": "not inside a Checkpoint Core repo"}))
+        else:
+            err("not inside a Checkpoint Core repo. Run `checkpoint-core init`.")
         return 1
     checks = [
         (".checkpoint store present", repo.paths.base.exists()),
@@ -1255,15 +1267,181 @@ def cmd_doctor(args) -> int:
         ("no orphaned active session", _active_ok(repo)),
         ("works without git", True),  # by construction: core never imports git
     ]
+    problems = sum(1 for _l, ok in checks if not ok)
+    if getattr(args, "json", False):
+        print(_dump({
+            "ok": problems == 0,
+            "version": __version__, "protocol_version": _proto(),
+            "checks": [{"name": l, "ok": ok} for l, ok in checks],
+            "problems": problems,
+        }))
+        return 0 if problems == 0 else 1
     for label, ok in checks:
         info("  [{}] {}".format(util.green("ok  ") if ok else util.red("FAIL"), label))
-        if not ok:
-            problems += 1
     if problems == 0:
         info(util.green("\nHealthy. Checkpoint Core is the source of truth; Git is optional."))
         return 0
     info(util.red("\n{} problem(s) found.".format(problems)))
     return 1
+
+
+def _proto():
+    from . import PROTOCOL_VERSION
+    return PROTOCOL_VERSION
+
+
+def cmd_version(args) -> int:
+    import platform
+    from . import PROTOCOL_VERSION, STORE_VERSION, FEATURES
+    store_version = None
+    try:
+        repo = Repo.discover()
+        store_version = repo.read_state().get("schema_version", STORE_VERSION)
+    except Exception:
+        pass
+    info_obj = {
+        "checkpoint_core": __version__,
+        "protocol_version": PROTOCOL_VERSION,
+        "store_version_supported": STORE_VERSION,
+        "store_version": store_version,
+        "features": FEATURES,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+    }
+    if getattr(args, "json", False):
+        print(_dump(info_obj))
+        return 0
+    info(util.bold("Checkpoint Core ") + __version__)
+    info("  protocol:   {}".format(PROTOCOL_VERSION))
+    info("  store:      v{} (this repo: {})".format(STORE_VERSION, store_version if store_version is not None else "n/a"))
+    info("  features:   {}".format(", ".join(FEATURES)))
+    info("  python:     {}".format(info_obj["python"]))
+    info("  platform:   {}".format(info_obj["platform"]))
+    return 0
+
+
+# ----------------------------------------------------------------- migrate (scaffolding)
+
+def cmd_migrate(args) -> int:
+    from . import STORE_VERSION
+    repo = _repo()
+    current = repo.read_state().get("schema_version", STORE_VERSION)
+    up_to_date = current == STORE_VERSION
+    sub = args.migrate_cmd or "status"
+    if sub == "status":
+        if getattr(args, "json", False):
+            print(_dump({"store_version": current, "supported": STORE_VERSION, "up_to_date": up_to_date}))
+        else:
+            info("store version: v{}  (supported: v{})".format(current, STORE_VERSION))
+            info(util.green("up to date; no migration needed.") if up_to_date
+                 else util.yellow("migration available."))
+        return 0
+    if sub == "plan":
+        steps = [] if up_to_date else ["v{} -> v{}".format(current, STORE_VERSION)]
+        if getattr(args, "json", False):
+            print(_dump({"steps": steps}))
+        else:
+            info("migration plan: " + ("no steps (up to date)" if not steps else ", ".join(steps)))
+        return 0
+    if sub == "apply":
+        if up_to_date:
+            info(util.green("nothing to apply; store is v{}.".format(current)))
+            return 0
+        # scaffolding: real migrations would transform objects/refs here, atomically.
+        info(util.yellow("no migration implemented for v{} -> v{}.".format(current, STORE_VERSION)))
+        return 0
+    err("unknown migrate subcommand")
+    return 2
+
+
+# ----------------------------------------------------------------- bug-report
+
+def cmd_bug_report(args) -> int:
+    import io
+    import platform
+    import tarfile
+    from . import PROTOCOL_VERSION
+    repo = _repo()
+    out = Path(args.out or "checkpoint-bug-report.tar.gz")
+
+    def redact(text):
+        return secretscan.redact(text)
+
+    manifest = {
+        "generated_at": util.now_iso(),
+        "checkpoint_core": __version__, "protocol_version": PROTOCOL_VERSION,
+        "python": platform.python_version(), "platform": platform.platform(),
+        "git_available": __import__("shutil").which("git") is not None,
+        "note": "private keys and tokens are NEVER included; text is secret-scanned and redacted.",
+    }
+    # diagnostics
+    try:
+        fsck_report = fsckmod.check(repo, strict=False)
+        manifest["fsck"] = {"result": fsck_report["result"], "objects": fsck_report["objects_scanned"],
+                            "corrupt": len(fsck_report["corrupt"]), "missing": len(fsck_report["missing"]),
+                            "dangling": fsck_report["dangling"]}
+    except Exception as exc:
+        manifest["fsck"] = {"error": str(exc)}
+    pol = policymod.load(repo)
+    manifest["policy"] = {"configured": pol is not None}
+    manifest["sessions"] = len(repo.session_ids())
+
+    # collect text artifacts (redacted), NEVER keys/, NEVER raw tokens
+    files = {}
+    cfg = repo.paths.config
+    if cfg.exists():
+        files["config.yaml"] = redact(cfg.read_text(encoding="utf-8"))
+    ident = repo.paths.identity
+    if ident.exists():
+        files["identity.json"] = ident.read_text(encoding="utf-8")  # public only
+    if repo.paths.ledger.exists():
+        tail = repo.paths.ledger.read_text(encoding="utf-8").splitlines()[-200:]
+        files["ledger.tail.jsonl"] = redact("\n".join(tail))
+    polp = policymod.policy_path(repo)
+    if polp.exists():
+        files["policy.yaml"] = redact(polp.read_text(encoding="utf-8"))
+
+    # secret-scan the collected text and record findings (values not included)
+    findings = []
+    for name, text in files.items():
+        findings += secretscan.scan_text(text, source=name)
+    manifest["secret_scan_findings"] = findings
+
+    with tarfile.open(out, "w:gz") as tar:
+        def add(name, data):
+            info_t = tarfile.TarInfo(name); info_t.size = len(data); info_t.mtime = 0
+            tar.addfile(info_t, io.BytesIO(data))
+        add("manifest.json", _dump(manifest).encode("utf-8"))
+        for name, text in files.items():
+            add(name, text.encode("utf-8"))
+        if getattr(args, "include_objects", False):
+            for oid in reachablemod.iter_object_ids(repo):
+                add("objects/{}/{}".format(oid[:2], oid),
+                    (repo.paths.objects / oid[:2] / oid).read_bytes())
+
+    info(util.green("Wrote bug report ") + str(out))
+    info("  redacted: private keys excluded, tokens/secrets scanned + redacted")
+    if findings:
+        info(util.yellow("  {} secret pattern(s) were redacted".format(len(findings))))
+    return 0
+
+
+# ----------------------------------------------------------------- agent helper
+
+def cmd_agent(args) -> int:
+    sub = args.agent_cmd
+    if sub == "begin":
+        # thin wrapper over `start` with agent metadata
+        ns = argparse.Namespace(instruction=args.instruction, prompt_file=None,
+                                actor="agent", agent=args.agent, model=args.model,
+                                tool=args.tool, tag=args.tag)
+        return cmd_start(ns)
+    if sub == "status":
+        return cmd_status(argparse.Namespace())
+    if sub == "packet":
+        return cmd_packet(argparse.Namespace(json=getattr(args, "json", False)))
+    err("usage: checkpoint-core agent begin|status|packet")
+    return 2
 
 
 def cmd_verify_history_silent(repo: Repo) -> bool:
@@ -2031,6 +2209,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--email", help="your email")
     sp.add_argument("--force", action="store_true")
     sp.add_argument("--yes", action="store_true")
+    sp.add_argument("--safe-git-adapter", action="store_true",
+                    help="print safe-trial guidance when run inside a Git repo")
     sp.set_defaults(func=cmd_init)
 
     sp = sub.add_parser("identity", help="manage signing identities and trust")
@@ -2216,7 +2396,35 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_git_import)
 
     sub.add_parser("verify-history", help="recompute and check snapshot seals").set_defaults(func=cmd_verify_history)
-    sub.add_parser("doctor", help="diagnose the installation").set_defaults(func=cmd_doctor)
+    sp = sub.add_parser("doctor", help="diagnose the installation")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser("version", help="show CLI/protocol/store versions and features")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_version)
+
+    sp = sub.add_parser("migrate", help="store migration (status/plan/apply scaffolding)")
+    msub = sp.add_subparsers(dest="migrate_cmd")
+    for mc in ("status", "plan", "apply"):
+        mp = msub.add_parser(mc); mp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_migrate, migrate_cmd=None, json=False)
+
+    sp = sub.add_parser("bug-report", help="write a redacted diagnostic bundle")
+    sp.add_argument("--out")
+    sp.add_argument("--include-objects", action="store_true",
+                    help="also include object-store contents (off by default)")
+    sp.set_defaults(func=cmd_bug_report)
+
+    sp = sub.add_parser("agent", help="agent helper: begin/status/packet")
+    asub = sp.add_subparsers(dest="agent_cmd")
+    ab = asub.add_parser("begin")
+    ab.add_argument("instruction")
+    ab.add_argument("--agent"); ab.add_argument("--model"); ab.add_argument("--tool")
+    ab.add_argument("--tag", action="append")
+    asub.add_parser("status")
+    ap = asub.add_parser("packet"); ap.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_agent, agent_cmd=None)
 
     # --- Phase 2: background autosave daemon, timeline, recovery ---
     sp = sub.add_parser("watch", help="continuously autosave the active session (foreground)")

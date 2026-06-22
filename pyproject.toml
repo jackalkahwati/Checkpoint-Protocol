@@ -4,15 +4,38 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "checkpoint-protocol"
-version = "0.1.0"
-description = "Checkpoint Core: a Git-replacement version-control protocol for human + AI code, with a Git import/export bridge and a Git-adapter wedge."
+version = "1.0.0-preview"
+description = "Checkpoint: AI-native version control. Git stores commits; Checkpoint records the whole work session — prompts, autosaves, snapshots, verification, policy, signatures."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
-authors = [{ name = "Checkpoint Protocol" }]
+authors = [{ name = "Jack Al-Kahwati" }]
+keywords = ["vcs", "version-control", "git", "ai", "agents", "provenance", "audit"]
 dependencies = [
   "PyYAML>=5.4",
 ]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Version Control",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.optional-dependencies]
+crypto = ["cryptography>=3.4"]   # optional fast Ed25519; a pure-Python fallback ships in-tree
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/jackalkahwati/Checkpoint-Protocol"
+Repository = "https://github.com/jackalkahwati/Checkpoint-Protocol"
+Issues = "https://github.com/jackalkahwati/Checkpoint-Protocol/issues"
 
 [project.scripts]
 checkpoint-core = "checkpoint_core.cli:main"

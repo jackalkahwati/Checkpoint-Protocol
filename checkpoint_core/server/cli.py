@@ -74,17 +74,41 @@ def cmd_doctor(args) -> int:
         ("store initialized", s.initialized),
         ("repos dir present", s.repos_dir.exists() or not s.initialized),
         ("config readable", _safe(lambda: s.load_config() is not None)),
+        ("web UI present", (Path(__file__).parent / "web" / "index.html").exists()),
         ("works without git", True),
     ]
-    problems = 0
+    problems = sum(1 for _l, ok in checks if not ok)
+    if getattr(args, "json", False):
+        import json
+        print(json.dumps({"ok": problems == 0,
+                          "checks": [{"name": l, "ok": ok} for l, ok in checks]}, indent=2))
+        return 0 if problems == 0 else 1
     for label, ok in checks:
         print("  [{}] {}".format(util.green("ok  ") if ok else util.red("FAIL"), label))
-        problems += 0 if ok else 1
     if problems == 0:
         print(util.green("\nServer is healthy."))
         return 0
     print(util.red("\n{} problem(s).".format(problems)))
     return 1
+
+
+def cmd_version(args) -> int:
+    import platform
+    from .. import __version__, PROTOCOL_VERSION, FEATURES
+    from . import API_VERSION
+    obj = {"checkpoint_server": __version__, "api_version": API_VERSION,
+           "protocol_version": PROTOCOL_VERSION, "features": FEATURES,
+           "python": platform.python_version(), "platform": platform.platform()}
+    if getattr(args, "json", False):
+        import json
+        print(json.dumps(obj, indent=2))
+        return 0
+    print(util.bold("Checkpoint Server ") + __version__)
+    print("  api:      {}".format(API_VERSION))
+    print("  protocol: {}".format(PROTOCOL_VERSION))
+    print("  python:   {}".format(obj["python"]))
+    print("  platform: {}".format(obj["platform"]))
+    return 0
 
 
 def _safe(fn):
@@ -123,7 +147,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("doctor", help="diagnose the server")
     sp.add_argument("--store")
+    sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser("version", help="show server/protocol versions and features")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_version)
     return p
 
 

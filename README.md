@@ -1,22 +1,43 @@
-# Checkpoint Protocol
+# Checkpoint
 
-**A new version-control protocol built for human + AI-generated code.**
+**AI-native version control for human and AI software teams.**
 
-Git was built for human-written code. Checkpoint is built for what comes next: where
-every human and AI coding session is continuously captured, verified, reversible, and
-promotable into clean accepted history. **Checkpoint Core is the source of truth. Git is
-supported only as an import/export and mirroring bridge, not as the foundation.**
+> **Git stores commits. Checkpoint records the full work session** — the prompt, the
+> autosaves, the snapshots, the verification, the policy, and the signatures — and promotes
+> only reviewed, signed, policy-approved work into clean history.
 
-![status: MVP](https://img.shields.io/badge/status-MVP-blue)
+![status: v1.0-preview](https://img.shields.io/badge/status-v1.0--preview-blue)
 ![python: 3.8+](https://img.shields.io/badge/python-3.8%2B-3776ab)
 ![no git required](https://img.shields.io/badge/core-no%20Git%20required-success)
 ![license: MIT](https://img.shields.io/badge/license-MIT-green)
 
-> **The simple test:** *If Git disappeared, would Checkpoint still work?*
-> For **Checkpoint Core: yes.** Sessions, snapshots, diffs, prompts, verification,
-> accepted states, branches, merges, and sync are native protocol objects in
-> Checkpoint's own content-addressed store. (Proven by the test suite, which runs the
-> entire VCS in directories that are not Git repos.)
+```bash
+pip install -e .          # checkpoint-core · checkpoint-server · checkpoint
+checkpoint-core init
+checkpoint-core identity create --name "You" --type human
+checkpoint-core start "make a change"   # … edit …
+checkpoint-core snapshot -m "wip"  &&  checkpoint-core verify  &&  checkpoint-core accept -m "done"
+checkpoint-core history
+bash examples/demo_all.sh               # see everything in 6 demos
+```
+
+**5-minute quickstart → [`docs/quickstart.md`](docs/quickstart.md).** Concepts →
+[`docs/concepts.md`](docs/concepts.md). FAQ → [`docs/faq.md`](docs/faq.md).
+
+The vocabulary (full glossary in [`docs/concepts.md`](docs/concepts.md)):
+
+- **Session** — the whole work episode (instruction, actor/agent, autosaves, snapshots,
+  verification, policy, signatures).
+- **Autosave** — continuous, recovery-only state. *You are never unsaved.*
+- **Snapshot** — a marked meaningful intermediate state.
+- **Accepted Snapshot** — official, sealed, signed history (the commit equivalent).
+- **Policy Decision** — whether an operation is allowed (deterministic, audited).
+- **Signature** — Ed25519 proof of *who approved this*. **Remote** — another store you sync
+  with. **Hosted Server** — HTTP API + **Web Review UI** for reviewing sessions.
+
+> **The simple test:** *If Git disappeared, would Checkpoint still work?* **Yes** — the core
+> is its own content-addressed store; the entire VCS is tested in directories that are not
+> Git repos. The `checkpoint` Git **adapter** is an adoption wedge, not the foundation.
 
 ---
 
