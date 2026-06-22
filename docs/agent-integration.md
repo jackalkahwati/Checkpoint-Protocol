@@ -1,8 +1,42 @@
 # Agent Integration
 
 Any AI coding agent can use Checkpoint to make its work **reviewable, recoverable, and
-governed**. The contract is three phases. The key rule: **the agent produces work; a human
-(or CI) accepts it.** Under the starter policy, agents cannot self-accept.
+governed**. The key rule: **the agent produces work; a human (or CI) accepts it.** Under the
+starter policy, agents cannot self-accept.
+
+## The one-verb path (recommended): `checkpoint-core claude`
+
+Don't make people learn Checkpoint first. One command before the agent, one decision after:
+
+```bash
+checkpoint-core claude "Fix the remote sync bug"
+```
+
+It sets up the repo if needed, starts a reviewed agent **session** (continuous autosave on),
+launches Claude Code with a guardrail prompt, runs your tests, builds the review packet, and
+shows **one** summary screen:
+
+```
+  Claude changed 8 file(s) (+120 -34).
+  Tests:      passed
+  Policy:     allowed
+  Signatures: will sign on accept as You
+  Risk:       normal
+
+  [a] accept   [r] rollback   [d] show diff   [p] open packet   [q] quit
+```
+
+Press `a` to accept (signed, sealed history) or `r` to roll back. That's the whole loop.
+Flags: `--model`, `--no-tests`, `--no-launch` (you make the changes), `--tag`, and
+`--decision accept|rollback|quit` for non-interactive use. The launched command is
+configurable via `CHECKPOINT_CLAUDE_CMD` (default `claude`). The guardrail prompt tells the
+agent to keep the change scoped and **not** accept/approve/rollback/override — Checkpoint
+handles those.
+
+## The manual contract (for other agents / custom flows)
+
+The three phases below are what `checkpoint-core claude` automates; use them directly to wire
+any other agent.
 
 ## The contract
 

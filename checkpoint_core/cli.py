@@ -209,6 +209,157 @@ def cmd_setup(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------- claude (one-verb wrapper)
+
+_CLAUDE_GUARDRAIL = """You are working inside a Checkpoint session.
+Task:
+{task}
+
+Keep the change scoped. Do not accept, approve, rollback, trust identities, or override
+policy — Checkpoint handles those. Make the code change, run the relevant tests, and stop
+when ready for human review."""
+
+
+def _claude_prompt(task: str) -> str:
+    return _CLAUDE_GUARDRAIL.format(task=task)
+
+
+def _claude_summary(repo: Repo, sess: Session) -> dict:
+    """The data behind the one-screen summary (pure; testable)."""
+    current = scan_to_tree(repo)
+    td = tree_diff(repo, sess.base_tree, current)
+    st = td["stats"]
+    ver = verifymod.last_verification(repo, sess)
+    vstatus = (ver.get("overall") if ver else None) or "not run"
+    pkt = util.read_json(repo.paths.session_dir(sess.id) / "packet.json", None)
+    secrets_found = len(pkt.get("secret_findings", [])) if pkt else 0
+    # policy preview for the human acceptor
+    pol = policymod.load(repo)
+    if pol is None:
+        effect = "allowed (no policy)"
+    else:
+        cur = idmod.load(repo, repo.current_identity_id()) if repo.current_identity_id() else {}
+        passed = [r.get("name") for r in (ver.get("results", []) if ver else []) if r.get("status") == "passed"]
+        d = policymod.evaluate(pol, {"operation": "accept", "actor_type": cur.get("type", "human"),
+                                     "branch": repo.head_branch(), "changed_paths": [f["path"] for f in td["files"]],
+                                     "will_sign": bool(repo.current_identity_id()),
+                                     "trust_status": "trusted" if cur.get("trusted") else "untrusted",
+                                     "verification_passed": passed})
+        effect = {"allow": "allowed", "deny": "DENIED — " + "; ".join(d["reasons"]),
+                  "warn": "warn — " + "; ".join(d["reasons"])}.get(d["effect"], d["effect"])
+    risk = "secrets detected ({})".format(secrets_found) if secrets_found else \
+        (", ".join(sess.data.get("risk_tags", [])) or "normal")
+    return {"files": st["files_changed"], "ins": st["insertions"], "dels": st["deletions"],
+            "tests": vstatus, "policy": effect, "signed": bool(repo.current_identity_id()),
+            "signer": (repo.identity() or {}).get("name", ""), "risk": risk,
+            "changes": td["files"]}
+
+
+def _print_claude_summary(s: dict) -> None:
+    info("")
+    info(util.bold("  Claude changed {} file(s) (+{} -{}).".format(s["files"], s["ins"], s["dels"])))
+    tcol = util.green if s["tests"] == "passed" else (util.yellow if s["tests"] in ("not run", "skipped") else util.red)
+    pcol = util.green if s["policy"].startswith("allow") else util.red
+    info("  Tests:      " + tcol(s["tests"]))
+    info("  Policy:     " + pcol(s["policy"]))
+    info("  Signatures: " + (util.dim("will sign on accept as " + s["signer"]) if s["signed"]
+                             else util.yellow("unsigned (no identity)")))
+    info("  Risk:       " + (util.yellow(s["risk"]) if s["risk"] != "normal" else "normal"))
+    info("")
+    info("  [a] accept   [r] rollback   [d] show diff   [p] open packet   [q] quit")
+
+
+def cmd_claude(args) -> int:
+    import os as _os, shlex as _shlex, subprocess as _sub
+    task = (args.task or "").strip()
+    if not task:
+        err('a task is required: checkpoint-core claude "<what to do>"')
+        return 2
+
+    # Dead-simple: set up the repo if needed so the user never has to learn Checkpoint first.
+    if not (Path.cwd() / ".checkpoint").exists():
+        rc = cmd_init(argparse.Namespace(branch=None, name=None, email=None, force=False,
+                                         yes=True, safe_git_adapter=False))
+        if rc:
+            return rc
+    repo = _repo()
+    if not repo.current_identity_id():
+        idmod.create(repo, name="You", id_type="human")
+        repo = _repo()
+    if Session.active(repo) is not None:
+        err("a session is already active ({}). Finish it first (accept/rollback).".format(
+            repo.active_session_id()))
+        return 1
+
+    # 1) start an agent session (this also starts continuous autosave in the background)
+    rc = cmd_start(argparse.Namespace(instruction=task, prompt_file=None, actor="agent",
+                                      agent="Claude Code", model=args.model, tool="claude",
+                                      tag=args.tag, no_watch=False))
+    if rc:
+        return rc
+
+    # 2) launch Claude Code with the guardrail prompt (configurable; inherits your terminal)
+    if not args.no_launch:
+        cmd = _shlex.split(_os.environ.get("CHECKPOINT_CLAUDE_CMD", "claude"))
+        info(util.dim("\nLaunching Claude Code — work the task, then exit Claude to return here.\n"))
+        try:
+            _sub.run(cmd + [_claude_prompt(task)])
+        except FileNotFoundError:
+            info(util.yellow("'{}' not found on PATH. Make your changes now, then return here "
+                             "and press Enter.".format(cmd[0])))
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                pass
+
+    # 3) run tests (unless --no-tests), then build the review packet
+    if not args.no_tests:
+        cmd_verify(argparse.Namespace())
+    cmd_packet(argparse.Namespace(json=False))
+
+    # 4) one summary screen + decision
+    return _claude_review(repo, args)
+
+
+def _claude_review(repo: Repo, args) -> int:
+    sess = Session.active(repo)
+    if sess is None:
+        info("No active session to review.")
+        return 0
+    _print_claude_summary(_claude_summary(repo, sess))
+
+    def do(choice: str) -> Optional[int]:
+        if choice in ("a", "accept"):
+            return cmd_accept(argparse.Namespace(message=sess.data.get("instruction"), no_verify=True,
+                                                 no_sign=False, force=False, override=False, reason=None))
+        if choice in ("r", "rollback"):
+            return cmd_rollback(argparse.Namespace(to_start=False, to_snapshot=None, hard=True,
+                                                   keep_files=False, yes=True, keep_session_active=False))
+        if choice in ("d", "diff"):
+            cmd_diff(argparse.Namespace(from_snapshot=None, to_snapshot=None, summary=False, files=False))
+            return None
+        if choice in ("p", "packet"):
+            cmd_packet(argparse.Namespace(json=False))
+            return None
+        if choice in ("q", "quit"):
+            info("Left the session open. Decide later: checkpoint-core accept | rollback")
+            return 0
+        return None
+
+    if args.decision:
+        rc = do(args.decision)
+        return rc if rc is not None else 0
+    while True:
+        try:
+            choice = input("\n> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            info("\nLeft the session open. Decide later: checkpoint-core accept | rollback")
+            return 0
+        rc = do(choice)
+        if rc is not None:
+            return rc
+
+
 # ---------------------------------------------------------------------- identity
 
 def _fp_short(rec) -> str:
@@ -2324,6 +2475,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--safe-git-adapter", action="store_true",
                     help="print safe-trial guidance when run inside a Git repo")
     sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("claude",
+                        help='run a Claude Code task in a reviewed session: claude "<task>"')
+    sp.add_argument("task")
+    sp.add_argument("--model", help="model hint recorded on the session")
+    sp.add_argument("--tag", action="append")
+    sp.add_argument("--no-tests", action="store_true", help="skip verification after Claude finishes")
+    sp.add_argument("--no-launch", action="store_true", help="don't launch Claude (you make changes), just review")
+    sp.add_argument("--decision", choices=["accept", "rollback", "diff", "packet", "quit"],
+                    help="non-interactive decision (default: ask)")
+    sp.set_defaults(func=cmd_claude)
 
     sp = sub.add_parser("setup",
                         help="one-shot: init + identity + ignore + remote + server repo + policy")
