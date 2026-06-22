@@ -406,6 +406,11 @@ checkpoint-server start --port 8800
 open http://127.0.0.1:8800/        # paste an API token to log in
 ```
 
+**Two UIs ship with Checkpoint:** the **embedded** zero-build vanilla-JS app at `/` (no Node,
+works offline), and a richer **Next.js** review app in [`frontend/`](frontend/) (`pnpm dev`)
+that talks to the server's `/ui/*` backend-for-frontend adapter (CORS enabled) and falls back
+to mock data offline.
+
 The **session review page** puts the whole work episode on one screen — instruction,
 agent/model/tool, timeline, rename-aware diff, packet, policy decision (allow/deny + reasons
 + required actions), signatures & trust (signer identity/type, trusted/untrusted/unknown/

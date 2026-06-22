@@ -75,10 +75,27 @@ rejected (403) on any other repo.
   hashes, seals, signatures, **reject private keys**) then import
 - `GET …/bundles/export?branch=` → `.tar.gz` *(repo:read)*
 
-### Web UI (no auth — the SPA shell)
-- `GET /` → the review UI (single-page app); `GET /app.js`, `GET /style.css`.
+### Web UI (no auth — the embedded SPA shell)
+- `GET /` → the embedded zero-build review UI; `GET /app.js`, `GET /style.css`.
   See [`checkpoint-web-ui.md`](checkpoint-web-ui.md). All data calls use the authenticated
   API below.
+
+### `/ui/*` — backend-for-frontend (BFF) adapter
+The richer **Next.js** frontend (in `frontend/`) consumes a UI-shaped adapter that returns
+exactly its TypeScript types, computed from the protocol data. The protocol-shaped endpoints
+below (used by the CLI) are unchanged. Adapter routes (token-scoped like their counterparts):
+`GET /ui/health`, `GET /ui/repos`, `GET /ui/repos/{o}/{r}`, `.../sessions`,
+`.../sessions/{id}`, `.../sessions/{id}/{timeline,diff,packet,verification,policy,signatures}`,
+`.../integrity`, `POST .../fsck`, `GET .../policy`, `POST .../policy/check`, `.../branches`,
+`.../identities`, `POST .../signatures/verify`, `.../audit`. Responses are arrays/objects in
+the frontend's shapes (e.g. a `Session` carries derived `verification_status`,
+`policy_effect`, `signature_status`, `fsck_status`; a diff `DiffFile` carries `hunks`).
+
+### CORS
+All responses include `Access-Control-Allow-Origin` (default `*`, set `cors_origin` in the
+server config) and the server answers `OPTIONS` preflight (204), so a separate frontend dev
+server (e.g. Next on :3000) can call the API on :8800. **No TLS** — front with HTTPS in
+anything but local/trusted use.
 
 ### Sessions / diffs
 - `GET …/sessions`, `GET …/sessions/{id}`, `…/{id}/timeline`, `…/{id}/packet`

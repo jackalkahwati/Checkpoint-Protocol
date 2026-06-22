@@ -719,6 +719,9 @@ ROUTES: List[Tuple[str, Any, Callable, Optional[str]]] = [
     ("GET", r"^/repos/([^/]+)/([^/]+)/audit$", h_audit, "repo:read"),
 ]
 
+from . import ui_api as _ui_api          # BFF adapter for the Next.js review UI (/ui/*)
+ROUTES = ROUTES + _ui_api.ROUTES
+
 _COMPILED = [(m, re.compile(rx), fn, sc) for (m, rx, fn, sc) in ROUTES]
 
 
@@ -734,11 +737,20 @@ def make_handler(store: ServerStore):
             length = int(self.headers.get("Content-Length", 0) or 0)
             return self.rfile.read(length) if length else b""
 
+        def _cors(self):
+            # Dev CORS so a separate frontend dev server (e.g. Next on :3000) can call the API.
+            origin = store.load_config().get("cors_origin", "*")
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Authorization,Content-Type")
+            self.send_header("Access-Control-Max-Age", "600")
+
         def _send_json(self, status, obj):
             data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            self._cors()
             self.end_headers()
             self.wfile.write(data)
 
@@ -746,6 +758,7 @@ def make_handler(store: ServerStore):
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
+            self._cors()
             self.end_headers()
             self.wfile.write(data)
 
@@ -811,6 +824,12 @@ def make_handler(store: ServerStore):
 
         def do_DELETE(self):
             self._dispatch("DELETE")
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self._cors()
+            self.end_headers()
 
     return Handler
 
