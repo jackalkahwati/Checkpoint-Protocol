@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import __version__, objects, util
-from . import autosave as autosavemod, engine, ledger as ledgermod
+from . import autosave as autosavemod, autowatch as autowatchmod, engine, ledger as ledgermod
 from . import fsck as fsckmod, gc as gcmod, reachable as reachablemod
 from . import identity as idmod, merge as mergemod, policy as policymod
 from . import remote as remotemod, secrets as secretscan, sign as signmod
@@ -320,6 +320,16 @@ def cmd_start(args) -> int:
     info("  base:        {}".format(_short(repo.head_snapshot()) if repo.head_snapshot() else "(unborn)"))
     if tags:
         info("  risk tags:   {}".format(", ".join(tags)))
+
+    # Continuous autosave for the life of the session (recovery-only; never history).
+    # Self-terminates when the session ends. Opt out with --no-watch or autosave.enabled=false.
+    if not getattr(args, "no_watch", False):
+        try:
+            pid = autowatchmod.start(repo)
+            if pid:
+                info(util.dim("  autosave:    on (background watcher, pid {}). You are never unsaved.".format(pid)))
+        except Exception:
+            pass  # autosave is best-effort; never block starting a session
     return 0
 
 
@@ -348,6 +358,9 @@ def cmd_status(args) -> int:
         info("    {} {}".format(_status_glyph(f["status"]), f["path"]))
     autos = sess.data.get("autosaves", [])
     snaps = sess.data.get("snapshots", [])
+    watch_pid = autowatchmod.running_pid(repo)
+    info("  autosave:      {}".format(
+        util.green("watching (pid {})".format(watch_pid)) if watch_pid else util.dim("not running")))
     info("  last autosave: {} ({} total)".format(autos[-1] if autos else "(none)", len(autos)))
     info("  last snapshot: {}".format(_short(snaps[-1]) if snaps else "(none)"))
     ver = verifymod.last_verification(repo, sess)
@@ -1493,11 +1506,20 @@ def cmd_watch(args) -> int:
     if not repo.config.autosave().get("enabled", True):
         err("autosave is disabled in config; enable autosave.enabled to watch.")
         return 1
-    w = Watcher(repo, sess,
-                debounce_ms=args.debounce_ms, poll_ms=args.poll_ms)
-    info(util.green("Checkpoint is watching. ") + util.dim("You are never unsaved."))
-    n = w.run(log=lambda m: info(util.dim("  " + m)))
-    info("Created {} autosave(s) this run.".format(n))
+    managed = getattr(args, "managed", False)   # spawned by `start`: log to file, clean pidfile
+    w = Watcher(repo, sess, debounce_ms=args.debounce_ms, poll_ms=args.poll_ms)
+    if not managed:
+        info(util.green("Checkpoint is watching. ") + util.dim("You are never unsaved."))
+    try:
+        if managed:
+            n = w.run(log=lambda m: print(m, flush=True))   # stdout is redirected to watch.log
+        else:
+            n = w.run(log=lambda m: info(util.dim("  " + m)))
+    finally:
+        if managed:
+            autowatchmod.clear_pidfile(repo)
+    if not managed:
+        info("Created {} autosave(s) this run.".format(n))
     return 0
 
 
@@ -2247,6 +2269,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--model")
     sp.add_argument("--tool")
     sp.add_argument("--tag", action="append")
+    sp.add_argument("--no-watch", action="store_true",
+                    help="do not start the background autosave watcher for this session")
     sp.set_defaults(func=cmd_start)
 
     sub.add_parser("status", help="show the active session").set_defaults(func=cmd_status)
@@ -2438,6 +2462,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("watch", help="continuously autosave the active session (foreground)")
     sp.add_argument("--debounce-ms", type=int, dest="debounce_ms")
     sp.add_argument("--poll-ms", type=int, dest="poll_ms")
+    sp.add_argument("--managed", action="store_true",
+                    help="internal: spawned by `start`; log to file and clean up the PID file")
     sp.set_defaults(func=cmd_watch)
 
     sp = sub.add_parser("autosave", help="list/show/restore/gc autosaves")
