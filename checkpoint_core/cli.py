@@ -870,9 +870,20 @@ def cmd_remote(args) -> int:
     repo = _repo()
     sub = args.remote_cmd or "list"
     if sub == "add":
-        remotemod.add_remote(repo, args.name, args.type, args.path,
-                             require_signed_snapshots=False)
-        info(util.green("Added remote ") + "{} ({}: {})".format(args.name, args.type, args.path))
+        loc = getattr(args, "location", None)
+        if loc and (loc.startswith("http://") or loc.startswith("https://")):
+            cfg = repo.config
+            cfg.data.setdefault("remotes", {})[args.name] = {
+                "type": "http", "url": loc, "token": getattr(args, "token", None)}
+            cfg.save()
+            info(util.green("Added remote ") + "{} (http: {})".format(args.name, loc))
+            return 0
+        path = args.path or loc
+        if not path:
+            err("provide a path (--path <dir>) or an http URL")
+            return 2
+        remotemod.add_remote(repo, args.name, "filesystem", path, require_signed_snapshots=False)
+        info(util.green("Added remote ") + "{} (filesystem: {})".format(args.name, path))
         return 0
     if sub == "remove":
         if remotemod.remove_remote(repo, args.name):
@@ -997,9 +1008,11 @@ def cmd_push(args) -> int:
         err(str(exc))
         return 1
     if not args.dry_run and res.get("status") == "pushed":
+        receipt = res.get("receipt") or {}
         ledgermod.append(repo, "push", None, repo.identity(),
                          {"remote": args.remote, "branch": branch,
-                          "objects": res.get("objects_sent", 0), "forced": res.get("forced")})
+                          "objects": res.get("objects_sent", 0), "forced": res.get("forced"),
+                          "receipt_id": receipt.get("receipt_id"), "receipt": receipt})
     if args.json:
         print(_dump(res))
     status = res.get("status")
@@ -1027,6 +1040,32 @@ def cmd_clone(args) -> int:
         err("destination exists and is not empty: {}".format(dest))
         return 1
     src = args.source
+    # http clone
+    if src.startswith("http://") or src.startswith("https://"):
+        repo = remotemod.bootstrap_store(dest)
+        repo.config.data.setdefault("remotes", {})["origin"] = {"type": "http", "url": src,
+                                                                "token": getattr(args, "token", None)}
+        repo.config.save()
+        report = remotemod.fetch(repo, "origin", tags=True, verify_signatures=args.verify_signatures)
+        if report["errors"]:
+            err("clone verification failed:")
+            for e in report["errors"][:20]:
+                info(util.red("  " + e))
+            return 1
+        rdir = repo.paths.base / "refs" / "remotes" / "origin"
+        branch = "main"
+        if rdir.exists():
+            for rf in rdir.iterdir():
+                if rf.is_file():
+                    repo.update_ref("refs/heads/{}".format(rf.name), rf.read_text(encoding="utf-8").strip())
+                    branch = rf.name
+        head = repo.read_ref("refs/heads/{}".format(branch))
+        if head:
+            repo.set_head_to_branch(branch)
+            materialize(repo, repo.get_object(head)["tree"], delete_extra=True)
+        ledgermod.append(repo, "clone", None, repo.identity(), {"source": src, "branch": branch})
+        info(util.green("Cloned ") + "{} -> {} (branch {})".format(src, dest, branch))
+        return 0
     # bundle clone vs filesystem clone
     if Path(src).is_file():
         repo = remotemod.bootstrap_store(dest)
@@ -2094,8 +2133,10 @@ def build_parser() -> argparse.ArgumentParser:
     rsub = sp.add_subparsers(dest="remote_cmd")
     radd = rsub.add_parser("add")
     radd.add_argument("name")
-    radd.add_argument("--type", default="filesystem", choices=["filesystem"])
-    radd.add_argument("--path", required=True)
+    radd.add_argument("location", nargs="?", help="http(s):// URL or a filesystem path")
+    radd.add_argument("--type", default="filesystem", choices=["filesystem", "http"])
+    radd.add_argument("--path")
+    radd.add_argument("--token", help="API token for an http remote")
     rsub.add_parser("list")
     rsh = rsub.add_parser("show"); rsh.add_argument("name")
     rrm = rsub.add_parser("remove"); rrm.add_argument("name")
@@ -2128,9 +2169,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_push)
 
-    sp = sub.add_parser("clone", help="create a local repo from a remote store or bundle")
+    sp = sub.add_parser("clone", help="create a local repo from a remote store, bundle, or URL")
     sp.add_argument("source")
     sp.add_argument("dest")
+    sp.add_argument("--token", help="API token for an http source")
     sp.add_argument("--verify-signatures", action="store_true")
     sp.set_defaults(func=cmd_clone)
 

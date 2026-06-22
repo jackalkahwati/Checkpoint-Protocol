@@ -8,7 +8,11 @@ remotes only; the model is designed so HTTP remotes can be added later.
 """
 from __future__ import annotations
 
+import base64
+import json
 import os
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -57,6 +61,244 @@ def remote_repo(spec: Dict[str, Any]) -> Repo:
     if not rr.initialized:
         raise ValueError("remote store is not initialized: {}".format(loc))
     return rr
+
+
+def is_http(spec: Dict[str, Any]) -> bool:
+    return spec.get("type") == "http"
+
+
+def _http_base(spec: Dict[str, Any]) -> str:
+    """Map a remote URL (http://host/owner/repo) to the repo API base (.../repos/owner/repo)."""
+    from urllib.parse import urlparse
+    u = spec["url"].rstrip("/")
+    if "/repos/" in u:
+        return u
+    p = urlparse(u)
+    parts = [x for x in p.path.split("/") if x]
+    if len(parts) >= 2:
+        owner, repo = parts[-2], parts[-1]
+        return "{}://{}/repos/{}/{}".format(p.scheme, p.netloc, owner, repo)
+    return u
+
+
+# ----------------------------------------------------------------- HTTP transport
+
+def _http(method: str, url: str, token: Optional[str] = None,
+          body: Any = None, raw: Optional[bytes] = None, timeout: float = 30.0):
+    headers: Dict[str, str] = {}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    elif raw is not None:
+        data = raw
+        headers["Content-Type"] = "application/octet-stream"
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = resp.read()
+            ct = resp.headers.get("Content-Type", "")
+            if "application/json" in ct:
+                return resp.status, json.loads(payload)
+            return resp.status, payload
+    except urllib.error.HTTPError as e:
+        payload = e.read()
+        try:
+            return e.code, json.loads(payload)
+        except Exception:
+            return e.code, {"error": payload.decode("utf-8", "replace")}
+
+
+def _collect_aux(repo: Repo, oids: Set[str]) -> Dict[str, Any]:
+    """Gather signatures, public identities, and (non-autosave) session files for transfer."""
+    signatures: Dict[str, Any] = {}
+    sess_ids: Set[str] = set()
+    extra: Set[str] = set()
+    for oid in oids:
+        sigs = signmod.signatures_for(repo, oid)
+        if sigs:
+            signatures[oid] = sigs
+        kind, obj = R.classify(repo, oid)
+        if kind == "snapshot" and obj and obj.get("session"):
+            sess_ids.add(obj["session"])
+    identities = []
+    if repo.paths.identities.exists():
+        for f in sorted(repo.paths.identities.glob("*.json")):
+            rec = util.read_json(f, {})
+            rec.pop("trusted", None)
+            identities.append(rec)
+    sessions = []
+    for sid in sorted(sess_ids):
+        extra |= _session_object_ids(repo, sid)
+        files = {}
+        sdir = repo.paths.session_dir(sid)
+        for p in sdir.rglob("*"):
+            if p.is_file() and p.relative_to(sdir).parts[0] != "autosaves":
+                files[str(p.relative_to(sdir))] = base64.b64encode(p.read_bytes()).decode("ascii")
+        sessions.append({"id": sid, "files": files})
+    return {"signatures": signatures, "identities": identities, "sessions": sessions,
+            "extra_oids": sorted(extra)}
+
+
+def _install_http_aux(repo: Repo, aux: Dict[str, Any]) -> None:
+    for oid, sigs in (aux.get("signatures") or {}).items():
+        for s in sigs:
+            util.write_json(repo.paths.signatures / oid / (s["signature_id"] + ".json"), s)
+    for rec in aux.get("identities") or []:
+        if "identity_id" not in rec:
+            continue
+        dest = repo.paths.identities / (rec["identity_id"] + ".json")
+        if not dest.exists():
+            rec = dict(rec)
+            rec["trusted"] = False
+            rec.setdefault("revoked", False)
+            util.write_json(dest, rec)
+    for sess in aux.get("sessions") or []:
+        sid = sess.get("id", "")
+        for rel, b64 in (sess.get("files") or {}).items():
+            parts = rel.split("/")
+            if ".." in parts or rel.startswith("/") or "keys" in parts or rel.endswith(".key"):
+                continue
+            dest = repo.paths.session_dir(sid) / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(base64.b64decode(b64))
+
+
+def _http_download_objects(repo: Repo, base_url: str, token: Optional[str], ids: List[str]) -> int:
+    copied = 0
+    CHUNK = 200
+    for i in range(0, len(ids), CHUNK):
+        batch = ids[i:i + CHUNK]
+        status, resp = _http("POST", base_url + "/objects/batch", token, {"get": batch})
+        if status != 200:
+            raise ValueError("object download failed: {}".format(resp))
+        for o in resp.get("objects", []):
+            data = base64.b64decode(o["data_b64"])
+            if util.sha256_bytes(data) != o["id"]:        # never trust the server
+                raise ValueError("server object {} failed content-hash check".format(o["id"]))
+            dest = repo.paths.objects / o["id"][:2] / o["id"]
+            if not dest.exists():
+                _atomic_write(dest, data)
+                copied += 1
+    return copied
+
+
+def _http_fetch(repo: Repo, name: str, spec: Dict[str, Any], branches, tags,
+                verify_signatures, dry_run) -> Dict[str, Any]:
+    url, token = _http_base(spec), spec.get("token")
+    report = {"remote": name, "dry_run": dry_run, "branches": [], "objects_copied": 0,
+              "refs_updated": [], "errors": []}
+    if branches is None:
+        st, refs = _http("GET", url + "/refs", token)
+        branches = list((refs or {}).get("heads", {}).keys()) if st == 200 else []
+    for b in branches:
+        st, resp = _http("POST", url + "/sync/fetch", token, {"branch": b})
+        if st != 200:
+            report["errors"].append("{}: {}".format(b, resp.get("error")))
+            continue
+        head = resp["head"]
+        missing = [o for o in resp["oids"] if not repo.has_object(o)]
+        entry = {"branch": b, "remote_head": head, "missing": len(missing)}
+        if dry_run:
+            report["branches"].append(entry)
+            continue
+        try:
+            report["objects_copied"] += _http_download_objects(repo, url, token, missing)
+        except ValueError as exc:
+            report["errors"].append("{}: {}".format(b, exc))
+            continue
+        _install_http_aux(repo, resp)
+        ok, errs = verify_received(repo, head, require_signatures=verify_signatures)
+        if not ok:
+            report["errors"].extend(["{}: {}".format(b, e) for e in errs])
+            entry["status"] = "rejected (verification failed)"
+            report["branches"].append(entry)
+            continue
+        atomic_update_ref(repo, "refs/remotes/{}/{}".format(name, b), head)
+        entry["status"] = "fetched"
+        report["refs_updated"].append("refs/remotes/{}/{}".format(name, b))
+        report["branches"].append(entry)
+    return report
+
+
+def _http_push(repo: Repo, name: str, spec: Dict[str, Any], branch, tags,
+               force_with_lease, dry_run) -> Dict[str, Any]:
+    url, token = _http_base(spec), spec.get("token")
+    lhead = repo.read_ref("refs/heads/{}".format(branch))
+    if not lhead:
+        return {"remote": name, "branch": branch, "status": "nothing-to-push", "dry_run": dry_run}
+    st, refs = _http("GET", url + "/refs", token)
+    rhead = (refs or {}).get("heads", {}).get(branch) if st == 200 else None
+    oids = syncmod.reachable_objects(repo, lhead)
+    aux = _collect_aux(repo, oids)
+    all_oids = sorted(set(oids) | set(aux.get("extra_oids", [])))
+    st, plan = _http("POST", url + "/sync/plan", token, {"oids": all_oids})
+    missing = plan.get("missing", all_oids) if st == 200 else all_oids
+    result = {"remote": name, "branch": branch, "local_head": lhead, "remote_head": rhead,
+              "missing_on_remote": len(missing), "dry_run": dry_run}
+    if dry_run:
+        result["status"] = "would-push"
+        return result
+    # upload missing objects
+    CHUNK = 100
+    for i in range(0, len(missing), CHUNK):
+        payload = []
+        for oid in missing[i:i + CHUNK]:
+            data = (repo.paths.objects / oid[:2] / oid).read_bytes()
+            payload.append({"id": oid, "data_b64": base64.b64encode(data).decode("ascii")})
+        st, resp = _http("POST", url + "/objects/batch", token, {"objects": payload})
+        if st != 200 or resp.get("rejected"):
+            return {**result, "status": "upload-failed", "detail": resp}
+    # finalize: server verifies closure + policy + ff, then updates the ref
+    st, resp = _http("POST", url + "/sync/push", token, {
+        "branch": branch, "old_head": rhead, "new_head": lhead,
+        "force_with_lease": force_with_lease if force_with_lease not in (None, "") else None,
+        "signatures": aux["signatures"], "identities": aux["identities"],
+        "sessions": aux["sessions"], "uploaded": missing,
+    })
+    if st == 200:
+        atomic_update_ref(repo, "refs/remotes/{}/{}".format(name, branch), lhead)
+        result["status"] = "pushed"
+        result["objects_sent"] = len(missing)
+        result["receipt"] = resp.get("receipt")
+        return result
+    if st == 409:
+        result["status"] = "rejected-non-fast-forward"
+        result["detail"] = resp
+        return result
+    if st == 403:
+        result["status"] = "policy-denied"
+        result["detail"] = resp
+        return result
+    result["status"] = "rejected"
+    result["detail"] = resp
+    return result
+
+
+def _http_sync_status(repo: Repo, name: str, spec: Dict[str, Any], branch) -> Dict[str, Any]:
+    url, token = _http_base(spec), spec.get("token")
+    st, refs = _http("GET", url + "/refs", token)
+    heads = (refs or {}).get("heads", {}) if st == 200 else {}
+    branches = [branch] if branch else sorted(set(repo.list_branches()) | set(heads.keys()))
+    out = {"remote": name, "branches": []}
+    for b in branches:
+        lhead = repo.read_ref("refs/heads/{}".format(b))
+        rhead = heads.get(b)
+        if lhead == rhead:
+            rel = "up-to-date"
+        elif rhead and not lhead:
+            rel = "behind"
+        elif lhead and not rhead:
+            rel = "ahead"
+        elif rhead and repo.has_object(rhead):
+            rel = _relationship(repo, lhead, rhead)
+        else:
+            rel = "behind (fetch needed)"
+        out["branches"].append({"branch": b, "local_head": lhead, "remote_head": rhead,
+                                "relationship": rel, "missing_locally": 0, "missing_remotely": 0})
+    return out
 
 
 # ----------------------------------------------------------------- atomic refs
@@ -301,6 +543,8 @@ def fetch(repo: Repo, name: str, branches: Optional[List[str]] = None, tags: boo
     spec = get_remote(repo, name)
     if not spec:
         raise ValueError("no such remote: {}".format(name))
+    if is_http(spec):
+        return _http_fetch(repo, name, spec, branches, tags, verify_signatures, dry_run)
     rr = remote_repo(spec)
     cfg = repo.config.sync()
     require_sigs = verify_signatures or bool(spec.get("require_signed_snapshots"))
@@ -378,9 +622,14 @@ def _fetch_tags(repo, rr, require_sigs, report, cfg, dry_run) -> None:
 def pull(repo: Repo, name: str, branch: str, verify_signatures: bool = False,
          dry_run: bool = False) -> Dict[str, Any]:
     if dry_run:
-        # plan only: fetch nothing, just report relationship using current tracking ref
-        rr = remote_repo(get_remote(repo, name))
-        rhead = rr.read_ref("refs/heads/{}".format(branch))
+        # plan only: fetch nothing, just report relationship
+        spec = get_remote(repo, name) or {}
+        if is_http(spec):
+            st, refs = _http("GET", _http_base(spec) + "/refs", spec.get("token"))
+            rhead = (refs or {}).get("heads", {}).get(branch) if st == 200 else None
+        else:
+            rr = remote_repo(spec)
+            rhead = rr.read_ref("refs/heads/{}".format(branch))
         lhead = repo.read_ref("refs/heads/{}".format(branch))
         rel = "unknown"
         if rhead and lhead and repo.has_object(rhead):
@@ -422,6 +671,8 @@ def push(repo: Repo, name: str, branch: str, tags: bool = False,
     spec = get_remote(repo, name)
     if not spec:
         raise ValueError("no such remote: {}".format(name))
+    if is_http(spec):
+        return _http_push(repo, name, spec, branch, tags, force_with_lease, dry_run)
     rr = remote_repo(spec)
     cfg = repo.config.sync()
     lhead = repo.read_ref("refs/heads/{}".format(branch))
@@ -489,6 +740,8 @@ def sync_status(repo: Repo, name: str, branch: Optional[str] = None) -> Dict[str
     spec = get_remote(repo, name)
     if not spec:
         raise ValueError("no such remote: {}".format(name))
+    if is_http(spec):
+        return _http_sync_status(repo, name, spec, branch)
     rr = remote_repo(spec)
     branches = [branch] if branch else sorted(set(repo.list_branches()) | set(rr.list_branches()))
     out = {"remote": name, "branches": []}

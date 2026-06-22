@@ -160,8 +160,8 @@ checkpoint-core git-import ./legacy-repo # import a Git repo; Checkpoint becomes
 | `timeline [<session-id>]` | The full story of a session: start, autosaves, snapshots, verification, accept, rollback. |
 | `recover [--restore [--to <id>] --yes]` | Detect an interrupted session and restore its latest (or a chosen) autosave. |
 | `branch [<name>]` / `checkout <name>` / `merge <name>` | Native branching and line-level (diff3) three-way merge: disjoint edits auto-merge, overlapping edits conflict. |
-| `remote add\|list\|show\|remove` | Manage filesystem remotes. |
-| `fetch` / `pull` / `push` / `clone` | Hardened sync: verify before refs move; fetch→tracking refs, FF-only pull, safe push (`--force-with-lease`). |
+| `remote add\|list\|show\|remove` | Manage filesystem **and HTTP** remotes (`remote add origin http://host/owner/repo --token …`). |
+| `fetch` / `pull` / `push` / `clone` | Hardened sync (filesystem or HTTP): verify before refs move; fetch→tracking refs, FF-only pull, safe push (`--force-with-lease`). |
 | `sync status <remote>` | Ahead/behind/diverged + missing-object counts. |
 | `bundle create\|verify\|import` | Portable `.tar.gz` transport; import verifies path-safety, hashes, seals, signatures, and rejects private keys. |
 | `git-export <dir>` / `git-import <dir>` | The Git bridge (the only Git-touching code). |
@@ -343,6 +343,36 @@ checkpoint-core policy audit                # every decision + overrides
   `fsck --policy` evaluates accepted history against the current policy. Opt-in: with no
   policy configured, nothing is enforced. See §16 of the spec.
 
+## Host it over HTTP (the service API)
+
+The hosted service exposes Checkpoint repos over HTTP **without weakening the protocol** —
+the server verifies before refs move, and neither side trusts the other.
+
+```bash
+checkpoint-server init-store .checkpoint-server
+checkpoint-server token create --store .checkpoint-server --name dev --scopes repo:read,repo:write
+checkpoint-server start --port 8800
+
+checkpoint-core remote add origin http://localhost:8800/acme/app --token <TOKEN>
+checkpoint-core push origin main      # uploads only missing objects; gets a signed receipt
+checkpoint-core clone http://localhost:8800/acme/app ./local --token <TOKEN>
+```
+
+- **API tokens with scopes** (`repo:read`/`repo:write`/…/`admin`), each optionally pinned to
+  one `owner/repo`. A read token can't write refs.
+- **Object-level transfer**: `sync/plan` → upload only missing → `sync/push`. The server
+  **verifies the closure, evaluates policy, enforces fast-forward / force-with-lease**, then
+  updates the ref **atomically under a per-repo lock** and returns a **ServerReceipt** the
+  client records in its ledger.
+- **Never trust either side**: the server rejects hash mismatches, refs to non-snapshots,
+  broken parent chains, invalid seals/signatures, policy violations, non-fast-forward
+  pushes, and path-traversal / private-key material in bundles; the client re-verifies
+  every object it downloads. **Private keys never cross the wire.**
+- **Read APIs for a future UI**: repos, refs, sessions, timelines, packets, rename-aware
+  diff, non-mutating merge-preview, signatures, policy decisions, fsck, gc, audit.
+- Built on the standard library; **works with Git uninstalled.** Full reference:
+  [`docs/checkpoint-hosted-api.md`](docs/checkpoint-hosted-api.md).
+
 ## How it works (native objects, no Git)
 
 - **Blob** — raw file bytes, addressed by `sha256(bytes)`.
@@ -410,8 +440,10 @@ It is a bridge for adoption, not the protocol. See
    refs move, never trust the remote.
 7. **Phase 7 (done):** policy engine — enforce who/what may change history, with audit and
    reasoned overrides.
-8. **Next:** hosted Checkpoint service API; web review UI; agent integrations (Cursor,
-   Claude Code, Codex, Copilot); public developer preview.
+8. **Phase 8 (done):** hosted service API — host repos over HTTP with token auth, verified
+   transfer, server-side policy, and audit; the protocol foundation for hosted Checkpoint.
+9. **Next:** web review UI; agent integrations (Cursor, Claude Code, Codex, Copilot);
+   public developer preview.
 4. **Phase 4:** hosted Checkpoint service (same object model and sync verbs over HTTP).
 5. **Phase 5:** web UI for sessions, diffs, prompts, verification, approvals, rollback.
 6. **Phase 6:** team workflow, policy engine, compliance, audit, enterprise controls.

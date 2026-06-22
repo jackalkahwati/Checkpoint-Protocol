@@ -928,7 +928,38 @@ test <fixture> | init | audit`.
 
 ---
 
-## 17. Conformance
+## 17. Hosted service (Phase 8)
+
+A hosted Checkpoint service exposes repositories over HTTP **without weakening the
+protocol**. The server never trusts the client and the client never blindly trusts the
+server; both verify object hashes, schemas, seals, parent chains, reachability,
+signatures, and policy, and **refs only move after verification**. The full endpoint
+reference is in [`checkpoint-hosted-api.md`](checkpoint-hosted-api.md). Highlights:
+
+- **Auth**: API tokens (SHA-256 hashed), scoped (`repo:read`/`repo:write`/… /`admin`) and
+  repo-scoped. Reads/writes are gated per endpoint.
+- **Transfer**: object-level negotiation (`sync/plan` → upload only missing → `sync/push`).
+  The server installs aux (signatures, **untrusted** public identities, sessions — never
+  autosaves, never keys), verifies the closure, evaluates policy, enforces
+  fast-forward / force-with-lease, then updates the ref **atomically under a per-repo
+  lock**, returning a **ServerReceipt** the client stores in its ledger.
+- **Rejects**: bad auth (401/403), malformed JSON (400), hash mismatch, refs to
+  non-snapshots, broken parents, invalid seals/signatures, policy violations (403),
+  non-fast-forward (409), path traversal / private-key material in bundles (422).
+- **Read APIs** (for a future web UI): repos, refs, objects, sessions, timelines, packets,
+  rename-aware diff, non-mutating merge-preview, identities, signatures, policy decisions,
+  fsck, gc, audit.
+- Built on the standard library; **works with Git uninstalled**; the Git bridge is never
+  imported. Client HTTP remotes: `remote add <name> http://host/owner/repo --token …`,
+  then `fetch`/`pull`/`push`/`clone`/`sync status` behave exactly as for filesystem
+  remotes.
+
+This is the API foundation for a hosted product; it adds no new core object types and
+preserves every §1–§16 guarantee.
+
+---
+
+## 18. Conformance
 
 An implementation conforms to Checkpoint Core Protocol 0.1 if it:
 

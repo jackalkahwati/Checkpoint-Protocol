@@ -16,10 +16,11 @@ dependencies = [
 
 [project.scripts]
 checkpoint-core = "checkpoint_core.cli:main"
+checkpoint-server = "checkpoint_core.server.cli:main"
 checkpoint = "checkpoint.cli:main"
 
 [tool.setuptools]
-packages = ["checkpoint_core", "checkpoint"]
+packages = ["checkpoint_core", "checkpoint_core.server", "checkpoint"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
