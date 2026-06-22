@@ -334,3 +334,16 @@ def test_objects_list_reachability(repo, capsys):
     assert run(["objects", "list", "--unreachable"]) == 0
     out = capsys.readouterr().out
     assert "UNREACHABLE" in out
+
+
+def test_fsck_allows_json_blob_with_type_field(repo):
+    """A captured package.json with {"type":"module"} is blob content, not a corrupt
+    object — fsck must not warn 'unknown type module'. (Regression: work-hub.)"""
+    from checkpoint_core import fsck as fsckmod
+    run(["init", "--email", "j@e.com"])
+    (repo / "package.json").write_text('{\n  "name": "x",\n  "type": "module"\n}\n')
+    run(["start", "add pkg"])
+    assert run(["accept", "--no-verify", "-m", "add pkg"]) == 0
+    rep = fsckmod.check(core(repo), strict=False)
+    assert not any("unknown type" in w for w in rep["warnings"]), rep["warnings"]
+    assert rep["result"] == "healthy"

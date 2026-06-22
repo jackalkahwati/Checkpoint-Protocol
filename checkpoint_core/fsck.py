@@ -151,7 +151,11 @@ def check(repo: Repo, strict: bool = False, aggressive: bool = False) -> Dict[st
             obj = _json.loads(raw.decode("utf-8"))
         except Exception:
             continue
-        if isinstance(obj, dict) and "type" in obj and obj["type"] not in R.KNOWN_TYPES:
+        # A blob's content is arbitrary bytes and may itself be JSON with a "type" field
+        # (e.g. a package.json containing {"type": "module"}). Such an object is referenced
+        # as a blob by a tree, so don't mistake its content for a Checkpoint object type.
+        if (isinstance(obj, dict) and "type" in obj and obj["type"] not in R.KNOWN_TYPES
+                and "blob" not in expected_types.get(oid, set())):
             warnings.append("object {} has unknown type '{}'".format(oid, obj["type"]))
 
     # 8) reachability accounting (dangling = unreachable, present on disk)
