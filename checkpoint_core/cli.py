@@ -127,6 +127,88 @@ def cmd_init(args) -> int:
     return 0
 
 
+_SETUP_IGNORE = """\
+# .checkpointignore — paths Checkpoint Core should never capture.
+# (.checkpoint/ and .git/ are always ignored.)
+node_modules/
+.next/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+dist/
+build/
+.DS_Store
+"""
+
+
+def _slug(s: str) -> str:
+    import re as _re
+    return _re.sub(r"[^a-z0-9-]+", "-", str(s).lower()).strip("-") or "repo"
+
+
+def cmd_setup(args) -> int:
+    """One-shot: init + identity + .checkpointignore + remote + server repo + policy.
+
+    Collapses the whole 'set this repo up for Checkpoint' flow into a single process.
+    Idempotent: never overwrites an existing repo; skips steps already done.
+    """
+    root = Path.cwd()
+    # 1. init (skip if already a Checkpoint repo — never overwrite)
+    if (root / ".checkpoint").exists():
+        info("Checkpoint already initialized here.")
+    else:
+        rc = cmd_init(argparse.Namespace(branch=getattr(args, "branch", None), name=None,
+                                         email=None, force=False, yes=True, safe_git_adapter=False))
+        if rc:
+            return rc
+    repo = _repo()
+    # 2. identity (create + auto-select a human identity if none)
+    if not repo.current_identity_id():
+        rec = idmod.create(repo, name=args.identity_name or "Jack Al-Kahwati", id_type="human")
+        ledgermod.append(repo, "identity", None, {"id": rec["identity_id"], "name": rec["name"]},
+                         {"type": rec["type"], "fingerprint": rec["fingerprint"]})
+        info(util.green("Created identity ") + "{} ({})".format(rec["name"], rec["identity_id"]))
+    else:
+        info("Using identity {}".format(repo.current_identity_id()))
+    # 3. .checkpointignore
+    ig = root / ".checkpointignore"
+    if not ig.exists():
+        ig.write_text(_SETUP_IGNORE, encoding="utf-8")
+        info("Wrote .checkpointignore")
+    # 4. server repo + remote + policy (one process, reusing the HTTP client)
+    if args.server:
+        if not args.token:
+            err("--server requires --token"); return 2
+        server = args.server.rstrip("/")
+        owner = args.owner or "jack"
+        name = args.name or _slug(root.name)
+        st, resp = remotemod._http("POST", server + "/repos", args.token, {"owner": owner, "repo": name})
+        if st in (200, 201):
+            info(util.green("Created server repo ") + "{}/{}".format(owner, name))
+        elif st == 409:
+            info("Server repo {}/{} already exists.".format(owner, name))
+        else:
+            info(util.yellow("Could not create server repo ({}): {}".format(st, resp)))
+        url = "{}/{}/{}".format(server, owner, name)            # user-facing remote URL
+        api = "{}/repos/{}/{}".format(server, owner, name)      # API base for this repo
+        cmd_remote(argparse.Namespace(remote_cmd="add", name=args.remote_name,
+                                      location=url, path=None, token=args.token))
+        if not args.no_policy:
+            import copy
+            pol = copy.deepcopy(policymod.DEFAULT_STARTER_POLICY)
+            pol["required_verification"] = {"default": False, "commands": ["tests"]}
+            st, _ = remotemod._http("PUT", api + "/policy", args.token, {"policy": pol})
+            if st == 200:
+                info(util.green("Applied policy ") + util.dim("(protect main; signed + trusted acceptor)"))
+    info("")
+    info(util.bold("Setup complete.") + " Next:")
+    info("  checkpoint-core start \"<what you're doing>\"      # autosave starts automatically")
+    info("  checkpoint-core accept -m \"…\"  &&  checkpoint-core push {} main".format(args.remote_name))
+    info(util.dim("  (signed identities are trusted on the server after your first push)"))
+    return 0
+
+
 # ---------------------------------------------------------------------- identity
 
 def _fp_short(rec) -> str:
@@ -2242,6 +2324,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--safe-git-adapter", action="store_true",
                     help="print safe-trial guidance when run inside a Git repo")
     sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("setup",
+                        help="one-shot: init + identity + ignore + remote + server repo + policy")
+    sp.add_argument("--server", help="Checkpoint server base URL, e.g. http://localhost:8800")
+    sp.add_argument("--token", help="API token for the server")
+    sp.add_argument("--owner", default="jack")
+    sp.add_argument("--name", help="server repo name (default: this directory's name)")
+    sp.add_argument("--remote-name", default="checkpoint", dest="remote_name")
+    sp.add_argument("--identity-name", dest="identity_name")
+    sp.add_argument("--branch")
+    sp.add_argument("--no-policy", action="store_true", dest="no_policy")
+    sp.set_defaults(func=cmd_setup)
 
     sp = sub.add_parser("identity", help="manage signing identities and trust")
     isub = sp.add_subparsers(dest="identity_cmd")

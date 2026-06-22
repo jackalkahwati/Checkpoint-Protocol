@@ -9,6 +9,7 @@ Run any command with `--help` for full flags. Three entry points:
 | Command | Purpose |
 |---|---|
 | `init [--branch --name --email --safe-git-adapter]` | Initialize a repo (no Git). |
+| `setup [--server --token --owner --name --remote-name --no-policy]` | One-shot: init + identity + `.checkpointignore` + server repo + remote + policy (idempotent). |
 | `identity create\|list\|show\|trust\|untrust\|revoke\|import\|export\|current\|use\|set` | Ed25519 identities + local trust. |
 | `start "<instruction>" [--actor --agent --model --tool --tag]` | Begin a session. |
 | `status` | Active session: changes, last autosave/snapshot, verification. |
