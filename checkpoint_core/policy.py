@@ -267,6 +267,9 @@ def evaluate(policy: Dict[str, Any], pin: Dict[str, Any]) -> Dict[str, Any]:
         for cmd in sorted(_required_verifications(req, rv) - passed):
             reasons.append("required verification '{}' has not passed".format(cmd))
             actions.append("run checkpoint-core verify ({})".format(cmd))
+        if req["min_approvals"] > 1 and int(pin.get("approvals", 1)) < req["min_approvals"]:
+            reasons.append("requires {} approvals".format(req["min_approvals"]))
+            actions.append("get {} review approval(s)".format(req["min_approvals"]))
 
     elif op == "push":
         ut = pin.get("ref_update_type", "fast_forward")

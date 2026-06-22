@@ -252,6 +252,12 @@ export const api = {
       method: "POST",
     }),
 
+  approveReview: (owner: string, repo: string, id: string, approve: boolean) =>
+    request<MergeRequest>(`/repos/${owner}/${repo}/reviews/${id}/approve`, {} as MergeRequest, {
+      method: "POST",
+      body: JSON.stringify({ approve }),
+    }),
+
   getIntegrity: (owner: string, repo: string) =>
     request<Integrity>(`/repos/${owner}/${repo}/integrity`, mockIntegrity),
 }

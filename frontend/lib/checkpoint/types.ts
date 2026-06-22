@@ -220,6 +220,8 @@ export interface MergeRequest {
   merged_snapshot?: string | null
   comment_count: number
   unresolved_count: number
+  approvals: string[]
+  approval_count: number
 }
 
 export interface MergeRequestDetail extends MergeRequest {

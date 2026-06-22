@@ -71,6 +71,7 @@ def create_review(store, owner: str, repo: str, r: Repo, *, title: str, descript
         "status": "open",
         "created_at": now,
         "comments": [],
+        "approvals": [],
         "merged_snapshot": None,
         "merged_at": None,
         "closed_at": None,
@@ -104,6 +105,21 @@ def resolve_comment(store, owner: str, repo: str, rid: str, cid: str, resolved: 
             _save(store, owner, repo, rec)
             return c
     return None
+
+
+def set_approval(store, owner: str, repo: str, rid: str, author: str, approve: bool, now: str) -> Optional[Dict[str, Any]]:
+    """Add or remove the caller's approval (deduped by author)."""
+    rec = get_review(store, owner, repo, rid)
+    if rec is None:
+        return None
+    approvals = [a for a in rec.get("approvals", []) if a.get("author") != author]
+    if approve:
+        approvals.append({"author": author, "at": now})
+    rec["approvals"] = approvals
+    _save(store, owner, repo, rec)
+    store.audit(owner, repo, {"operation": "mr_approve" if approve else "mr_unapprove",
+                              "mr": rid, "result": "success", "actor": author, "timestamp": now})
+    return rec
 
 
 def close_review(store, owner: str, repo: str, rid: str, now: str) -> Optional[Dict[str, Any]]:
@@ -190,7 +206,8 @@ def merge_review(store, owner: str, repo: str, r: Repo, rid: str, *, now: str) -
         decision = policymod.evaluate(pol, {
             "operation": "merge", "actor_type": _source_actor_type(r, store, owner, repo, rec),
             "branch": rec["target_branch"], "changed_paths": changed,
-            "will_sign": True, "trust_status": "trusted"})
+            "will_sign": True, "trust_status": "trusted",
+            "approvals": len(rec.get("approvals", []))})
         if decision["effect"] == "deny":
             store.audit(owner, repo, {"operation": "mr_merge", "mr": rid, "result": "policy-denied",
                                       "reasons": decision["reasons"], "timestamp": now})

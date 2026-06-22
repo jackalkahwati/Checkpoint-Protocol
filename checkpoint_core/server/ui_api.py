@@ -587,6 +587,8 @@ def _ui_review(rec: Dict[str, Any]) -> Dict[str, Any]:
         "merged_at": rec.get("merged_at"), "merged_snapshot": rec.get("merged_snapshot"),
         "comment_count": len(comments),
         "unresolved_count": sum(1 for c in comments if not c.get("resolved")),
+        "approvals": [a.get("author") for a in rec.get("approvals", [])],
+        "approval_count": len(rec.get("approvals", [])),
     }
 
 
@@ -655,9 +657,15 @@ def ui_review_detail(ctx):
             sess = _load_session(repo, rec["source_session"])
             if sess:
                 actor = (sess.get("actor", {}) or {}).get("type", "human")
+        try:
+            dr = diff_result(repo, head_tree, src_tree)
+            changed = dr["added"] + dr["deleted"] + dr["modified"] + [x["new_path"] for x in dr["renamed"]]
+        except Exception:
+            changed = []
         d = policymod.evaluate(pol, {"operation": "merge", "actor_type": actor,
                                      "branch": rec["target_branch"], "will_sign": True,
-                                     "trust_status": "trusted"})
+                                     "trust_status": "trusted", "changed_paths": changed,
+                                     "approvals": len(rec.get("approvals", []))})
         out["policy"] = _ui_decision(d)
     out["mergeable"] = bool(out["mergeability"]["clean"] and rec["status"] == "open"
                             and (out["policy"] is None or out["policy"]["effect"] != "deny"))
@@ -703,6 +711,15 @@ def ui_review_close(ctx):
     return (200, _ui_review(rec)) if rec else (404, {"error": "no such merge request"})
 
 
+def ui_review_approve(ctx):
+    repo, err, o, n = _repo(ctx)
+    if err:
+        return err
+    approve = (ctx.body or {}).get("approve", True)
+    rec = reviewsmod.set_approval(ctx.store, o, n, ctx.params[2], _author(ctx), bool(approve), util.now_iso())
+    return (200, _ui_review(rec)) if rec else (404, {"error": "no such merge request"})
+
+
 # (method, regex, handler, required_scope) — appended to the server's ROUTES
 ROUTES = [
     ("GET", r"^/ui/health$", ui_health, None),
@@ -713,6 +730,7 @@ ROUTES = [
     ("POST", r"^/ui/repos/([^/]+)/([^/]+)/reviews/([^/]+)/comments/([^/]+)/resolve$", ui_review_comment_resolve, "repo:write"),
     ("POST", r"^/ui/repos/([^/]+)/([^/]+)/reviews/([^/]+)/merge$", ui_review_merge, "repo:write"),
     ("POST", r"^/ui/repos/([^/]+)/([^/]+)/reviews/([^/]+)/close$", ui_review_close, "repo:write"),
+    ("POST", r"^/ui/repos/([^/]+)/([^/]+)/reviews/([^/]+)/approve$", ui_review_approve, "repo:write"),
     ("GET", r"^/ui/repos$", ui_list_repos, "repo:read"),
     ("GET", r"^/ui/repos/([^/]+)/([^/]+)$", ui_get_repo, "repo:read"),
     ("GET", r"^/ui/repos/([^/]+)/([^/]+)/sessions$", ui_list_sessions, "repo:read"),

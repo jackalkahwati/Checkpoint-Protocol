@@ -206,7 +206,7 @@ export function ReviewDetail({ owner, repo, id }: { owner: string; repo: string;
   const mr = data as MergeRequestDetail
   if (!mr?.id) return <ErrorState title="Not found" message="No such merge request." />
 
-  async function act(kind: "merge" | "close", fn: () => Promise<unknown>) {
+  async function act(kind: "merge" | "close" | "approve", fn: () => Promise<unknown>) {
     setActionErr(null)
     setBusy(kind)
     try {
@@ -258,11 +258,20 @@ export function ReviewDetail({ owner, repo, id }: { owner: string; repo: string;
         </Banner>
       )}
 
-      {/* policy + actions */}
+      {/* policy + approvals + actions */}
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card p-4">
-        <div className="flex items-center gap-2 text-sm">
-          <span className="text-muted-foreground">Policy:</span>
-          {mr.policy ? <PolicyBadge effect={mr.policy.effect} /> : <span className="text-muted-foreground">none</span>}
+        <div className="flex flex-wrap items-center gap-3 text-sm">
+          <span className="flex items-center gap-1.5">
+            <span className="text-muted-foreground">Policy:</span>
+            {mr.policy ? <PolicyBadge effect={mr.policy.effect} /> : <span className="text-muted-foreground">none</span>}
+          </span>
+          <span className="flex items-center gap-1.5">
+            <CheckCircle2 className={`size-4 ${mr.approval_count > 0 ? "text-success" : "text-muted-foreground"}`} />
+            <span className="text-muted-foreground">
+              {mr.approval_count} approval{mr.approval_count === 1 ? "" : "s"}
+              {mr.approvals.length ? <span className="ml-1 text-foreground">({mr.approvals.join(", ")})</span> : null}
+            </span>
+          </span>
           {mr.policy && mr.policy.effect === "deny" ? (
             <span className="text-xs text-destructive">{mr.policy.reasons.join("; ")}</span>
           ) : null}
@@ -270,6 +279,17 @@ export function ReviewDetail({ owner, repo, id }: { owner: string; repo: string;
         <div className="flex gap-2">
           {mr.status === "open" ? (
             <>
+              <Button size="sm" variant="outline" disabled={busy !== null}
+                onClick={() => act("approve", () => api.approveReview(owner, repo, id, true))}>
+                <CheckCircle2 data-icon="inline-start" />
+                Approve
+              </Button>
+              {mr.approval_count > 0 ? (
+                <Button size="sm" variant="ghost" disabled={busy !== null}
+                  onClick={() => act("approve", () => api.approveReview(owner, repo, id, false))}>
+                  Remove approval
+                </Button>
+              ) : null}
               <Button size="sm" disabled={!mr.mergeable || busy !== null} onClick={() => act("merge", () => api.mergeReview(owner, repo, id))}>
                 <GitMerge data-icon="inline-start" />
                 {busy === "merge" ? "Merging…" : "Merge"}
@@ -283,10 +303,23 @@ export function ReviewDetail({ owner, repo, id }: { owner: string; repo: string;
       </div>
       {actionErr ? <p className="text-sm text-destructive">{actionErr}</p> : null}
 
-      {/* diff */}
+      {/* diff with inline line comments */}
       <section className="flex flex-col gap-2">
         <h2 className="text-sm font-semibold text-foreground">Changes</h2>
-        <DiffViewer files={mr.diff ?? []} />
+        <DiffViewer
+          files={mr.diff ?? []}
+          review={{
+            comments: mr.comments,
+            onAddComment: async (path, line, body) => {
+              await api.addReviewComment(owner, repo, id, { body, path, line })
+              reload()
+            },
+            onResolve: async (cid, resolved) => {
+              await api.resolveReviewComment(owner, repo, id, cid, resolved)
+              reload()
+            },
+          }}
+        />
       </section>
 
       {/* comments */}

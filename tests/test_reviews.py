@@ -158,3 +158,51 @@ def test_close_review(server, tmp_path):
     assert st == 200 and d["status"] == "closed"
     st, res = ui(server, "/repos/o/r/reviews/mr_1/merge", "POST", {})
     assert res["status"] == "invalid"                     # can't merge a closed MR
+
+
+def test_approvals_tracked(server, tmp_path):
+    setup_repo(server, tmp_path)
+    feature = _heads(server)["feature"]
+    ui(server, "/repos/o/r/reviews", "POST", {"title": "x", "source_snapshot": feature})
+    st, mr = ui(server, "/repos/o/r/reviews/mr_1/approve", "POST", {"approve": True})
+    assert st == 200 and mr["approval_count"] == 1
+    st, d = ui(server, "/repos/o/r/reviews/mr_1")
+    assert d["approval_count"] == 1 and "admin" in d["approvals"]
+    # idempotent (same author) + removable
+    ui(server, "/repos/o/r/reviews/mr_1/approve", "POST", {"approve": True})
+    assert ui(server, "/repos/o/r/reviews/mr_1")[1]["approval_count"] == 1
+    ui(server, "/repos/o/r/reviews/mr_1/approve", "POST", {"approve": False})
+    assert ui(server, "/repos/o/r/reviews/mr_1")[1]["approval_count"] == 0
+
+
+def test_min_approvals_policy_gates_merge(server, tmp_path):
+    import copy
+    from checkpoint_core import policy as P
+    setup_repo(server, tmp_path)
+    pol = copy.deepcopy(P.DEFAULT_STARTER_POLICY)
+    pol["required_verification"] = {"default": False, "commands": []}
+    pol["path_rules"] = [{"paths": ["b.py", "*.py", "**"], "require": {"min_approvals": 2}, "label": "needs-2"}]
+    http("PUT", server["url"] + "/repos/o/r/policy", server["admin"], {"policy": pol})
+    # trust the signer so only approvals gate the merge
+    for i in http("GET", server["url"] + "/repos/o/r/identities", server["admin"])[1]["identities"]:
+        http("POST", "{}/repos/o/r/identities/{}/trust".format(server["url"], i["identity_id"]), server["admin"])
+    feature = _heads(server)["feature"]
+    ui(server, "/repos/o/r/reviews", "POST", {"title": "needs approvals", "source_snapshot": feature})
+
+    # 0 approvals -> policy denies, not mergeable
+    st, d = ui(server, "/repos/o/r/reviews/mr_1")
+    assert d["policy"]["effect"] == "deny" and d["mergeable"] is False
+    st, res = ui(server, "/repos/o/r/reviews/mr_1/merge", "POST", {})
+    assert st == 403 and res["status"] == "policy-denied"
+
+    # 1 approval (admin) -> still denied
+    ui(server, "/repos/o/r/reviews/mr_1/approve", "POST", {"approve": True})
+    assert ui(server, "/repos/o/r/reviews/mr_1/merge", "POST", {})[1]["status"] == "policy-denied"
+
+    # 2nd distinct approver -> now allowed + merges
+    tok2 = server["store"].create_token("reviewer2", ["admin"], "*")["token"]
+    http("POST", "{}/ui/repos/o/r/reviews/mr_1/approve".format(server["url"]), tok2, {"approve": True})
+    st, d = ui(server, "/repos/o/r/reviews/mr_1")
+    assert d["approval_count"] == 2 and d["policy"]["effect"] != "deny" and d["mergeable"] is True
+    st, res = ui(server, "/repos/o/r/reviews/mr_1/merge", "POST", {})
+    assert st == 200 and res["status"] == "merged"

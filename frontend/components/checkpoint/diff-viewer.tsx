@@ -9,12 +9,20 @@ import {
   FileWarning,
   FileX,
   ImageIcon,
+  MessageSquarePlus,
 } from "lucide-react"
 import type { LucideIcon } from "lucide-react"
 import { useState } from "react"
 
 import { cn } from "@/lib/utils"
-import type { ChangeType, DiffFile, DiffLine } from "@/lib/checkpoint/types"
+import type { ChangeType, DiffFile, DiffLine, MRComment } from "@/lib/checkpoint/types"
+
+// Optional review hooks: when provided, the diff supports inline line comments.
+export interface DiffReview {
+  comments: MRComment[]
+  onAddComment: (path: string, line: number | null, body: string) => Promise<void> | void
+  onResolve?: (commentId: string, resolved: boolean) => Promise<void> | void
+}
 
 const changeMeta: Record<ChangeType, { icon: LucideIcon; label: string; tone: string }> = {
   added: { icon: FilePlus, label: "added", tone: "text-success" },
@@ -42,21 +50,92 @@ function FilePath({ file }: { file: DiffFile }) {
 function lineClass(kind: DiffLine["kind"]): string {
   switch (kind) {
     case "add":
-      return "bg-success-muted text-foreground before:content-['+'] before:text-success"
+      return "bg-success-muted text-foreground"
     case "del":
-      return "bg-danger-muted text-foreground before:content-['-'] before:text-danger"
+      return "bg-danger-muted text-foreground"
     case "conflict-ours":
-      return "bg-info-muted text-foreground before:content-['+']"
+      return "bg-info-muted text-foreground"
     case "conflict-theirs":
-      return "bg-warning-muted text-foreground before:content-['+']"
+      return "bg-warning-muted text-foreground"
     case "conflict-marker":
-      return "bg-danger/15 font-semibold text-danger before:content-['!']"
+      return "bg-danger/15 font-semibold text-danger"
     default:
-      return "text-muted-foreground before:content-['_'] before:opacity-0"
+      return "text-muted-foreground"
   }
 }
 
-function DiffBody({ file }: { file: DiffFile }) {
+function lineMarker(kind: DiffLine["kind"]): string {
+  if (kind === "add" || kind === "conflict-ours" || kind === "conflict-theirs") return "+"
+  if (kind === "del") return "-"
+  if (kind === "conflict-marker") return "!"
+  return " "
+}
+
+function hunkNewStart(header: string): number {
+  const m = header.match(/\+(\d+)/)
+  return m ? parseInt(m[1], 10) : 1
+}
+
+function LineComment({ c, review }: { c: MRComment; review?: DiffReview }) {
+  return (
+    <div className="mx-3 my-1 rounded-md border border-border bg-card px-2.5 py-1.5 font-sans text-xs whitespace-normal">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-muted-foreground">
+          <span className="font-medium text-foreground">{c.author}</span>
+          {c.resolved ? <span className="ml-1 text-success">· resolved</span> : null}
+        </span>
+        {review?.onResolve ? (
+          <button
+            type="button"
+            className="text-[11px] text-muted-foreground hover:text-foreground"
+            onClick={() => review.onResolve?.(c.id, !c.resolved)}
+          >
+            {c.resolved ? "Reopen" : "Resolve"}
+          </button>
+        ) : null}
+      </div>
+      <p className="mt-0.5 text-foreground">{c.body}</p>
+    </div>
+  )
+}
+
+function InlineComposer({
+  onSubmit,
+  onCancel,
+}: {
+  onSubmit: (body: string) => void
+  onCancel: () => void
+}) {
+  const [body, setBody] = useState("")
+  return (
+    <div className="mx-3 my-1 flex flex-col gap-1.5 rounded-md border border-border bg-card p-2 font-sans">
+      <textarea
+        autoFocus
+        value={body}
+        onChange={(e) => setBody(e.target.value)}
+        rows={2}
+        placeholder="Comment on this line…"
+        className="w-full rounded border border-border bg-background px-2 py-1 text-xs"
+      />
+      <div className="flex justify-end gap-1.5">
+        <button type="button" className="rounded px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground" onClick={onCancel}>
+          Cancel
+        </button>
+        <button
+          type="button"
+          className="rounded bg-primary px-2 py-0.5 text-xs font-medium text-primary-foreground disabled:opacity-50"
+          disabled={!body.trim()}
+          onClick={() => body.trim() && onSubmit(body.trim())}
+        >
+          Comment
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function DiffBody({ file, review }: { file: DiffFile; review?: DiffReview }) {
+  const [composeAt, setComposeAt] = useState<number | null>(null)
   if (file.change_type === "binary") {
     return (
       <div className="flex items-center gap-2 px-3 py-4 text-xs text-muted-foreground">
@@ -65,34 +144,78 @@ function DiffBody({ file }: { file: DiffFile }) {
       </div>
     )
   }
+  const byLine = new Map<number, MRComment[]>()
+  if (review) {
+    for (const c of review.comments) {
+      if (c.path === file.new_path && typeof c.line === "number") {
+        byLine.set(c.line, [...(byLine.get(c.line) ?? []), c])
+      }
+    }
+  }
   return (
     <div className="overflow-x-auto">
-      {file.hunks.map((hunk, hi) => (
-        <div key={hi}>
-          <div className="bg-secondary/60 px-3 py-1 font-mono text-[11px] text-muted-foreground">{hunk.header}</div>
-          <pre className="font-mono text-xs leading-relaxed">
-            {hunk.lines.map((line, li) => (
-              <div
-                key={li}
-                className={cn(
-                  "px-3 before:mr-2 before:inline-block before:w-2 before:text-center",
-                  lineClass(line.kind),
-                )}
-              >
-                {line.text || " "}
-              </div>
-            ))}
-          </pre>
-        </div>
-      ))}
+      {file.hunks.map((hunk, hi) => {
+        let newLine = hunkNewStart(hunk.header) - 1
+        return (
+          <div key={hi}>
+            <div className="bg-secondary/60 px-3 py-1 font-mono text-[11px] text-muted-foreground">{hunk.header}</div>
+            <div className="font-mono text-xs leading-relaxed">
+              {hunk.lines.map((line, li) => {
+                const hasNew = line.kind !== "del" && line.kind !== "conflict-marker"
+                if (hasNew) newLine += 1
+                const ln = hasNew ? newLine : null
+                const lineComments = ln !== null ? byLine.get(ln) ?? [] : []
+                return (
+                  <div key={li}>
+                    <div className={cn("group flex items-start", lineClass(line.kind))}>
+                      {review && ln !== null ? (
+                        <button
+                          type="button"
+                          title="Comment on this line"
+                          onClick={() => setComposeAt(composeAt === ln ? null : ln)}
+                          className="mt-px hidden w-5 shrink-0 text-center text-primary group-hover:block hover:text-primary/80"
+                        >
+                          +
+                        </button>
+                      ) : review ? (
+                        <span className="w-5 shrink-0" />
+                      ) : null}
+                      <span className="w-10 shrink-0 select-none pr-2 text-right text-[10px] text-muted-foreground/60">
+                        {ln ?? ""}
+                      </span>
+                      <span className="flex-1 whitespace-pre px-1">
+                        <span className="mr-1 inline-block w-2 text-center opacity-70">{lineMarker(line.kind)}</span>
+                        {line.text || " "}
+                      </span>
+                    </div>
+                    {lineComments.map((c) => (
+                      <LineComment key={c.id} c={c} review={review} />
+                    ))}
+                    {review && composeAt === ln && ln !== null ? (
+                      <InlineComposer
+                        onCancel={() => setComposeAt(null)}
+                        onSubmit={async (b) => {
+                          await review.onAddComment(file.new_path, ln, b)
+                          setComposeAt(null)
+                        }}
+                      />
+                    ) : null}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
 }
 
-function DiffFileCard({ file, defaultOpen }: { file: DiffFile; defaultOpen?: boolean }) {
+function DiffFileCard({ file, defaultOpen, review }: { file: DiffFile; defaultOpen?: boolean; review?: DiffReview }) {
   const [open, setOpen] = useState(defaultOpen ?? file.change_type === "conflict")
   const meta = changeMeta[file.change_type]
   const Icon = meta.icon
+  const fileComments = review ? review.comments.filter((c) => c.path === file.new_path && (c.line === null || c.line === undefined)) : []
 
   return (
     <div id={`file-${file.new_path}`} className="overflow-hidden rounded-lg border border-border bg-card">
@@ -129,14 +252,21 @@ function DiffFileCard({ file, defaultOpen }: { file: DiffFile; defaultOpen?: boo
               <span className="text-muted-foreground">Resolve before acceptance</span>
             </div>
           ) : null}
-          <DiffBody file={file} />
+          {fileComments.length > 0 ? (
+            <div className="border-b border-border py-1">
+              {fileComments.map((c) => (
+                <LineComment key={c.id} c={c} review={review} />
+              ))}
+            </div>
+          ) : null}
+          <DiffBody file={file} review={review} />
         </div>
       ) : null}
     </div>
   )
 }
 
-export function DiffViewer({ files }: { files: DiffFile[] }) {
+export function DiffViewer({ files, review }: { files: DiffFile[]; review?: DiffReview }) {
   if (files.length === 0) {
     return <p className="px-1 py-6 text-center text-sm text-muted-foreground">No file changes in this session.</p>
   }
@@ -161,7 +291,7 @@ export function DiffViewer({ files }: { files: DiffFile[] }) {
         })}
       </div>
       {files.map((f) => (
-        <DiffFileCard key={f.new_path + f.old_path} file={f} />
+        <DiffFileCard key={f.new_path + f.old_path} file={f} review={review} />
       ))}
     </div>
   )
