@@ -67,6 +67,22 @@ class Paths:
     def cache(self) -> Path:
         return self.base / "cache"
 
+    @property
+    def identities(self) -> Path:
+        return self.base / "identities"
+
+    @property
+    def keys(self) -> Path:
+        return self.base / "keys"
+
+    @property
+    def signatures(self) -> Path:
+        return self.base / "signatures"
+
+    @property
+    def current_identity(self) -> Path:
+        return self.base / "current_identity"
+
     def session_dir(self, sid: str) -> Path:
         return self.sessions / sid
 
@@ -270,5 +286,22 @@ class Repo:
         return self._config
 
     # ---------------------------------------------------------------- identity
+    def current_identity_id(self) -> Optional[str]:
+        p = self.paths.current_identity
+        if p.exists():
+            return p.read_text(encoding="utf-8").strip() or None
+        return None
+
     def identity(self) -> Dict[str, str]:
+        """Author dict {id,name,email}. Prefers the active signing identity, else the
+        legacy identity.json. (Read directly to avoid importing the identity module.)"""
+        cur = self.current_identity_id()
+        if cur:
+            rec = util.read_json(self.paths.identities / (cur + ".json"), None)
+            if rec:
+                return {
+                    "id": rec.get("identity_id", cur),
+                    "name": rec.get("name", ""),
+                    "email": (rec.get("metadata") or {}).get("email", ""),
+                }
         return util.read_json(self.paths.identity, {"id": "anon", "name": "", "email": ""})

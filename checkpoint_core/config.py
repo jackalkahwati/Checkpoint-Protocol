@@ -60,6 +60,16 @@ def default_config(project: str = "") -> Dict[str, Any]:
             "verify_timeline": True,
             "verify_renames": True,
         },
+        "trust": {
+            "require_signed_accepts": False,
+            "require_trusted_acceptor": False,
+            "require_signed_merges": False,
+            "require_signed_tags": True,
+            "allow_unsigned_sessions": True,
+            "allowed_acceptor_types": ["human", "ci"],
+            "allowed_agent_accept": False,
+            "sign_snapshots": False,
+        },
     }
 
 
@@ -126,6 +136,9 @@ class Config:
 
     def fsck(self) -> Dict[str, Any]:
         return self.data.get("fsck", {}) or {}
+
+    def trust(self) -> Dict[str, Any]:
+        return self.data.get("trust", {}) or {}
 
     def risk_rules_for(self, tags: List[str]) -> Dict[str, Any]:
         rules = self.data.get("risk_rules", {}) or {}

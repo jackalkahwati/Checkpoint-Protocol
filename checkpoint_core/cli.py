@@ -14,7 +14,8 @@ from typing import List, Optional
 from . import __version__, objects, util
 from . import autosave as autosavemod, engine, ledger as ledgermod
 from . import fsck as fsckmod, gc as gcmod, reachable as reachablemod
-from . import merge as mergemod, secrets as secretscan, timeline as timelinemod
+from . import identity as idmod, merge as mergemod, secrets as secretscan
+from . import sign as signmod, timeline as timelinemod
 from . import sync as syncmod, verify as verifymod
 from .watcher import Watcher
 from .config import Config, default_config
@@ -118,23 +119,142 @@ def cmd_init(args) -> int:
 
 # ---------------------------------------------------------------------- identity
 
+def _fp_short(rec) -> str:
+    return (rec.get("fingerprint") or "")[:24]
+
+
 def cmd_identity(args) -> int:
     repo = _repo()
-    ident = repo.identity()
-    if not (args.name or args.email):
-        info("id:    {}".format(ident.get("id")))
-        info("name:  {}".format(ident.get("name")))
-        info("email: {}".format(ident.get("email")))
+    sub = args.identity_cmd or "current"
+
+    if sub == "set":  # legacy author identity (name/email in identity.json)
+        ident = repo.identity()
+        if args.name:
+            ident["name"] = args.name
+        if args.email:
+            ident["email"] = args.email
+            ident["id"] = args.email
+        util.write_json(repo.paths.identity, ident)
+        ledgermod.append(repo, "identity", None, ident, {})
+        info(util.green("Identity updated: ") + "{} <{}>".format(ident.get("name"), ident.get("email")))
         return 0
-    if args.name:
-        ident["name"] = args.name
-    if args.email:
-        ident["email"] = args.email
-        ident["id"] = args.email
-    util.write_json(repo.paths.identity, ident)
-    ledgermod.append(repo, "identity", None, ident, {})
-    info(util.green("Identity updated: ") + "{} <{}>".format(ident["name"], ident["email"]))
-    return 0
+
+    if sub == "create":
+        rec = idmod.create(repo, name=args.name or "", id_type=args.type or "human",
+                           email=args.email)
+        ledgermod.append(repo, "identity", None, {"id": rec["identity_id"], "name": rec["name"]},
+                         {"type": rec["type"], "fingerprint": rec["fingerprint"]})
+        info(util.green("Created identity ") + util.bold(rec["identity_id"]))
+        info("  name:        {}".format(rec["name"]))
+        info("  type:        {}".format(rec["type"]))
+        info("  fingerprint: {}".format(rec["fingerprint"]))
+        info("  key:         {} (private, 0600)".format(idmod.key_path(repo, rec["identity_id"])))
+        if repo.current_identity_id() == rec["identity_id"]:
+            info("  set as the active signing identity.")
+        return 0
+
+    if sub == "list":
+        recs = idmod.list_all(repo)
+        if not recs:
+            info("No identities. Create one: checkpoint-core identity create --name \"You\"")
+            return 0
+        cur = repo.current_identity_id()
+        info(util.bold("{:<30} {:<8} {:<10} {}".format("IDENTITY", "TYPE", "TRUST", "FINGERPRINT")))
+        for r in recs:
+            trust = "revoked" if r.get("revoked") else ("trusted" if r.get("trusted") else "untrusted")
+            mark = "* " if r["identity_id"] == cur else "  "
+            info("{}{:<28} {:<8} {:<10} {}".format(mark, r["identity_id"], r["type"],
+                                                   _color_trust(trust), _fp_short(r)))
+        return 0
+
+    if sub == "show":
+        rec = idmod.load(repo, args.id)
+        if not rec:
+            err("no such identity: {}".format(args.id))
+            return 1
+        info(util.bold("Identity ") + util.cyan(rec["identity_id"]))
+        info("  name:        {}".format(rec.get("name")))
+        info("  type:        {}".format(rec.get("type")))
+        info("  fingerprint: {}".format(rec.get("fingerprint")))
+        info("  algorithm:   {}".format(rec.get("key_algorithm")))
+        info("  created:     {}".format(rec.get("created_at")))
+        info("  capabilities:{}".format(" " + ", ".join(rec.get("capabilities", []))))
+        info("  trusted:     {}".format(rec.get("trusted")))
+        info("  revoked:     {}".format(rec.get("revoked")))
+        info("  has private: {}".format(idmod.has_private(repo, rec["identity_id"])))
+        warn = idmod.key_permissions_warning(repo, rec["identity_id"])
+        if warn:
+            info(util.yellow("  WARNING: " + warn))
+        return 0
+
+    if sub in ("trust", "untrust"):
+        rec = idmod.set_trust(repo, args.id, sub == "trust")
+        if not rec:
+            err("no such identity: {}".format(args.id))
+            return 1
+        ledgermod.append(repo, "trust", None, repo.identity(),
+                         {"identity": rec["identity_id"], "trusted": sub == "trust"})
+        info(util.green("Identity {} is now {}.".format(rec["identity_id"], sub + "ed")))
+        return 0
+
+    if sub == "revoke":
+        rec = idmod.revoke(repo, args.id)
+        if not rec:
+            err("no such identity: {}".format(args.id))
+            return 1
+        info(util.yellow("Identity {} revoked.".format(rec["identity_id"])))
+        return 0
+
+    if sub == "import":
+        data = util.read_json(args.path, None)
+        if not data:
+            err("could not read identity file: {}".format(args.path))
+            return 1
+        rec = idmod.import_record(repo, data)
+        info(util.green("Imported identity ") + util.bold(rec["identity_id"]) +
+             util.yellow(" (untrusted)"))
+        info("  Run `checkpoint-core identity trust {}` to trust it.".format(rec["identity_id"]))
+        return 0
+
+    if sub == "export":
+        rec = idmod.export_record(repo, args.id)
+        if not rec:
+            err("no such identity: {}".format(args.id))
+            return 1
+        out = args.out or "{}.identity.json".format(rec["identity_id"])
+        util.write_json(Path(out), rec)
+        info(util.green("Exported public identity ") + rec["identity_id"] + " -> " + out)
+        info(util.dim("  (public key only; private key never exported)"))
+        return 0
+
+    if sub == "current":
+        rec = idmod.current(repo)
+        if not rec:
+            info("No active signing identity. Create one: checkpoint-core identity create --name \"You\"")
+            info("(author falls back to {})".format(repo.identity().get("id")))
+            return 0
+        info("active signing identity: {} ({}) {}".format(
+            rec["identity_id"], rec["type"], rec["fingerprint"]))
+        return 0
+
+    if sub == "use":
+        rec = idmod.load(repo, args.id)
+        if not rec:
+            err("no such identity: {}".format(args.id))
+            return 1
+        if not idmod.has_private(repo, rec["identity_id"]):
+            info(util.yellow("note: no private key for this identity; it cannot sign."))
+        idmod.set_current(repo, rec["identity_id"])
+        info(util.green("Active signing identity: ") + rec["identity_id"])
+        return 0
+
+    err("unknown identity subcommand")
+    return 2
+
+
+def _color_trust(t: str) -> str:
+    return {"trusted": util.green, "untrusted": util.yellow,
+            "revoked": util.red}.get(t, lambda x: x)(t)
 
 
 # ------------------------------------------------------------------------- start
@@ -168,9 +288,15 @@ def cmd_start(args) -> int:
     tags = list(args.tag or [])
 
     sess = Session.create(repo, instruction, actor, agent, tags, base_tree)
+    # record the active signing identity (if any) on the session
+    cur_id = repo.current_identity_id()
+    if cur_id:
+        sess.data["signing_identity"] = cur_id
+        sess.save()
     repo.set_active_session(sess.id)
     ledgermod.append(repo, "session_start", sess.id, actor,
-                     {"instruction": instruction, "base_tree": base_tree, "risk_tags": tags})
+                     {"instruction": instruction, "base_tree": base_tree, "risk_tags": tags,
+                      "signing_identity": cur_id})
     timelinemod.append(repo, sess.id, "session_started",
                        {"instruction": instruction, "base_snapshot": sess.base_head})
 
@@ -231,6 +357,14 @@ def cmd_snapshot(args) -> int:
         info("  message: {}".format(args.message))
     info("  changes: {} files, +{} -{}".format(st["files_changed"], st["insertions"], st["deletions"]))
     info("  object:  {}".format(snap["id"]))
+    # optionally sign manual snapshots
+    if args.sign or repo.config.trust().get("sign_snapshots"):
+        signer = idmod.current(repo)
+        if signer and idmod.has_private(repo, signer["identity_id"]):
+            signmod.sign_snapshot(repo, snap["id"], signer["identity_id"])
+            info("  signed:  by {}".format(signer["identity_id"]))
+        elif args.sign:
+            info(util.yellow("  signed:  no active identity with a private key"))
     return 0
 
 
@@ -358,6 +492,28 @@ def cmd_accept(args) -> int:
         err("risk rule requires a human to accept this session (actor is an agent).")
         return 1
 
+    # --- trust policy (Phase 5) ---
+    trust = repo.config.trust()
+    signer = idmod.current(repo)
+    signer_can_sign = bool(signer and idmod.has_private(repo, signer["identity_id"]))
+    if not args.force:
+        if trust.get("require_signed_accepts") and not signer_can_sign:
+            err("trust policy requires a signed accept, but no signing identity is active.")
+            info("Create/select one: checkpoint-core identity create --name \"You\"")
+            return 1
+        if signer:
+            if trust.get("require_trusted_acceptor") and not idmod.is_trusted(repo, signer["identity_id"]):
+                err("trust policy requires a trusted acceptor; {} is not trusted.".format(signer["identity_id"]))
+                return 1
+            allowed_types = trust.get("allowed_acceptor_types") or []
+            if allowed_types and signer.get("type") not in allowed_types:
+                err("trust policy forbids acceptor type '{}' (allowed: {}).".format(
+                    signer.get("type"), ", ".join(allowed_types)))
+                return 1
+            if signer.get("type") == "agent" and not trust.get("allowed_agent_accept", False):
+                err("trust policy forbids an agent identity from accepting.")
+                return 1
+
     verification_ref = None
     force_verify = bool(rules.get("require_verification"))
     do_verify = (not args.no_verify) and (force_verify or repo.config.run_on_accept())
@@ -409,11 +565,22 @@ def cmd_accept(args) -> int:
                      {"snapshot": oid, "message": message, "files": len(pkt["changed_files"])})
     timelinemod.append(repo, sess.id, "accepted", {"snapshot": oid, "message": message})
 
+    # sign the accepted snapshot by default if a signing identity is active
+    sig = None
+    if signer_can_sign and not args.no_sign:
+        sig = signmod.sign_snapshot(repo, oid, signer["identity_id"])
+        ledgermod.append(repo, "sign", sess.id, repo.identity(),
+                         {"snapshot": oid, "signature": sig["signature_id"]})
+
     info(util.green("Accepted session ") + util.bold(sess.id))
     info("  snapshot: {}".format(_short(oid)))
     info("  branch:   {} -> {}".format(repo.head_branch(), _short(oid)))
     info("  message:  {}".format(message))
     info("  sealed:   {}".format(objects.verify_seal(repo.get_object(oid))))
+    if sig:
+        info("  signed:   {} by {}".format(util.green("yes"), signer["identity_id"]))
+    elif signer:
+        info("  signed:   {}".format(util.yellow("no (no private key)")))
     info("\nHistory advanced in Checkpoint's own store. No Git involved.")
     return 0
 
@@ -664,6 +831,11 @@ def cmd_merge(args) -> int:
     ledgermod.append(repo, "merge", None, repo.identity(),
                      {"into": branch, "from": args.name, "type": "three-way",
                       "head": oid, "auto_merged": len(result["auto_merged"])})
+    # sign merge snapshots by default if a signing identity is active
+    signer = idmod.current(repo)
+    if signer and idmod.has_private(repo, signer["identity_id"]):
+        signmod.sign_snapshot(repo, oid, signer["identity_id"])
+        info("  signed merge by {}".format(signer["identity_id"]))
     info(util.green("Merged ") + "{} into {} ({})".format(args.name, branch, _short(oid)))
     if result.get("rename_records"):
         for r in result["rename_records"]:
@@ -1049,8 +1221,22 @@ def _dump(obj) -> str:
 def cmd_fsck(args) -> int:
     repo = _repo()
     report = fsckmod.check(repo, strict=args.strict)
+
+    sig_findings = None
+    if args.verify_signatures or args.require_signatures:
+        sig_findings = _signature_findings(repo)
+        report["signatures"] = sig_findings
+        if args.require_signatures:
+            bad = (len(sig_findings["unsigned_accepted"]) + sig_findings["invalid"]
+                   + sig_findings["revoked"])
+            if bad:
+                report["result"] = "corrupt"
+                report["errors"].append(
+                    "signature policy: {} unsigned, {} invalid, {} revoked accepted snapshot(s)".format(
+                        len(sig_findings["unsigned_accepted"]), sig_findings["invalid"],
+                        sig_findings["revoked"]))
+
     if args.json:
-        # strip large nested fsck echoes for cleanliness
         print(_dump(report))
         return fsckmod.exit_code(report, strict=args.strict)
     info(util.bold("Checkpoint fsck"))
@@ -1067,10 +1253,57 @@ def cmd_fsck(args) -> int:
         info(util.red("  ERROR    {}".format(e)))
     for w in report["warnings"][:100]:
         info(util.yellow("  warning  {}".format(w)))
+    if sig_findings is not None:
+        info(util.bold("  signatures:"))
+        info("    signed accepted:   {}".format(sig_findings["signed_accepted"]))
+        info("    unsigned accepted: {}".format(len(sig_findings["unsigned_accepted"])))
+        info("    valid: {}  untrusted: {}  unknown: {}  invalid: {}".format(
+            sig_findings["valid"], sig_findings["untrusted"],
+            sig_findings["unknown_signer"], sig_findings["invalid"]))
     res = report["result"]
     color = {"healthy": util.green, "warnings": util.yellow, "corrupt": util.red}[res]
     info("\nResult: " + color(res))
     return fsckmod.exit_code(report, strict=args.strict)
+
+
+def _signature_findings(repo) -> dict:
+    """Per-accepted-snapshot signature summary for fsck."""
+    accepted: List[str] = []
+    seen = set()
+    for kind_dir in ("heads", "tags"):
+        d = repo.paths.base / "refs" / kind_dir
+        if d.exists():
+            for ref in d.iterdir():
+                if ref.is_file():
+                    for oid in repo.history(ref.read_text(encoding="utf-8").strip()):
+                        if oid not in seen:
+                            seen.add(oid)
+                            accepted.append(oid)
+    unsigned: List[str] = []
+    valid = untrusted = unknown = invalid = revoked = signed = 0
+    for oid in accepted:
+        sigs = signmod.signatures_for(repo, oid)
+        if not sigs:
+            unsigned.append(oid)
+            continue
+        signed += 1
+        statuses = [signmod.verify_record(repo, s) for s in sigs]
+        ok = [v for v in statuses if v["ok"]]
+        if any(v["status"] == "valid" for v in ok):
+            valid += 1
+        elif any(v["status"] == "untrusted" for v in ok):
+            untrusted += 1
+        elif any(v["status"] == "unknown_signer" for v in ok):
+            unknown += 1
+        elif any(v["status"] == "revoked" for v in ok):
+            revoked += 1
+        else:
+            invalid += 1
+    return {
+        "accepted": len(accepted), "signed_accepted": signed,
+        "unsigned_accepted": unsigned, "valid": valid, "untrusted": untrusted,
+        "unknown_signer": unknown, "revoked": revoked, "invalid": invalid,
+    }
 
 
 def cmd_gc(args) -> int:
@@ -1183,6 +1416,97 @@ def cmd_objects(args) -> int:
     return 2
 
 
+# --------------------------------------------------- sign / verify / trust (Phase 5)
+
+def cmd_sign(args) -> int:
+    repo = _repo()
+    signer = idmod.current(repo)
+    if not signer:
+        err("no active signing identity. Run `checkpoint-core identity create --name \"You\"`.")
+        return 1
+    if not idmod.has_private(repo, signer["identity_id"]):
+        err("active identity {} has no private key.".format(signer["identity_id"]))
+        return 1
+    kind, obj = reachablemod.classify(repo, args.object_id)
+    if kind == "missing":
+        err("no such object: {}".format(args.object_id))
+        return 1
+    if kind != "snapshot":
+        err("only snapshots can be signed in this phase (got {})".format(kind))
+        return 1
+    sig = signmod.sign_snapshot(repo, args.object_id, signer["identity_id"])
+    ledgermod.append(repo, "sign", None, repo.identity(),
+                     {"snapshot": args.object_id, "signature": sig["signature_id"]})
+    info(util.green("Signed ") + _short(args.object_id) + " by " + signer["identity_id"])
+    return 0
+
+
+def cmd_verify_signatures(args) -> int:
+    repo = _repo()
+    report = signmod.verify_all(repo)
+    if args.json:
+        print(_dump(report))
+        return 0 if report["ok"] else 1
+    if not report["results"]:
+        info("No signatures in the store.")
+        return 0
+    info(util.bold("Signature verification"))
+    for r in report["results"]:
+        glyph = util.green("OK  ") if r["ok"] else util.red("FAIL")
+        info("  [{}] {}  {}  signer={}".format(glyph, _short(r["object"]),
+                                               _color_trust_status(r["status"]), r["signer"]))
+    info("  counts: {}".format(report["counts"]))
+    info("Result: " + (util.green("all signatures valid") if report["ok"] else util.red("INVALID signatures present")))
+    return 0 if report["ok"] else 1
+
+
+def _color_trust_status(s: str):
+    return {"valid": util.green, "untrusted": util.yellow, "unknown_signer": util.yellow,
+            "revoked": util.red, "invalid": util.red}.get(s, lambda x: x)(s)
+
+
+def cmd_trust_status(args) -> int:
+    repo = _repo()
+    # accepted snapshots = everything reachable from refs
+    accepted: List[str] = []
+    seen = set()
+    for kind_dir in ("heads", "tags"):
+        d = repo.paths.base / "refs" / kind_dir
+        if d.exists():
+            for ref in d.iterdir():
+                if ref.is_file():
+                    head = ref.read_text(encoding="utf-8").strip()
+                    for oid in repo.history(head):
+                        if oid not in seen:
+                            seen.add(oid)
+                            accepted.append(oid)
+    unsigned = []
+    by_status: Dict[str, int] = {}
+    for oid in accepted:
+        sigs = signmod.signatures_for(repo, oid)
+        if not sigs:
+            unsigned.append(oid)
+            continue
+        best = "invalid"
+        for s in sigs:
+            v = signmod.verify_record(repo, s)
+            best = v["status"] if v["ok"] else best
+        by_status[best] = by_status.get(best, 0) + 1
+
+    revoked = [r["identity_id"] for r in idmod.list_all(repo) if r.get("revoked")]
+    info(util.bold("Trust status"))
+    info("  accepted snapshots:      {}".format(len(accepted)))
+    info("  unsigned accepted:       {}".format(len(unsigned)))
+    for k in ("valid", "untrusted", "unknown_signer", "revoked", "invalid"):
+        if by_status.get(k):
+            info("  {:<24} {}".format(k + ":", by_status[k]))
+    info("  revoked identities:      {}".format(len(revoked)))
+    if unsigned:
+        for oid in unsigned[:20]:
+            info(util.yellow("  unsigned  {}".format(_short(oid))))
+    return 0
+
+
 # ------------------------------------------------------------------------ parser
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1200,10 +1524,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--yes", action="store_true")
     sp.set_defaults(func=cmd_init)
 
-    sp = sub.add_parser("identity", help="show or set the author identity")
-    sp.add_argument("--name")
-    sp.add_argument("--email")
-    sp.set_defaults(func=cmd_identity)
+    sp = sub.add_parser("identity", help="manage signing identities and trust")
+    isub = sp.add_subparsers(dest="identity_cmd")
+    icr = isub.add_parser("create")
+    icr.add_argument("--name", default="")
+    icr.add_argument("--type", choices=list(idmod.TYPES), default="human")
+    icr.add_argument("--email")
+    isub.add_parser("list")
+    ish = isub.add_parser("show"); ish.add_argument("id")
+    itr = isub.add_parser("trust"); itr.add_argument("id")
+    iun = isub.add_parser("untrust"); iun.add_argument("id")
+    irv = isub.add_parser("revoke"); irv.add_argument("id")
+    iim = isub.add_parser("import"); iim.add_argument("path")
+    iex = isub.add_parser("export"); iex.add_argument("id"); iex.add_argument("--out")
+    isub.add_parser("current")
+    ius = isub.add_parser("use"); ius.add_argument("id")
+    ise = isub.add_parser("set"); ise.add_argument("--name"); ise.add_argument("--email")
+    sp.set_defaults(func=cmd_identity, identity_cmd=None)
 
     sp = sub.add_parser("start", help="start a session")
     sp.add_argument("instruction", nargs="?", default="")
@@ -1219,6 +1556,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("snapshot", help="capture a meaningful snapshot")
     sp.add_argument("--message", "-m")
+    sp.add_argument("--sign", action="store_true", help="sign this snapshot")
     sp.set_defaults(func=cmd_snapshot)
 
     sp = sub.add_parser("diff", help="native diff (session start -> now, or between snapshots)")
@@ -1238,6 +1576,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("accept", help="accept -> new accepted snapshot (native history)")
     sp.add_argument("--message", "-m")
     sp.add_argument("--no-verify", action="store_true")
+    sp.add_argument("--no-sign", action="store_true", help="do not sign even if an identity is active")
     sp.add_argument("--force", action="store_true")
     sp.set_defaults(func=cmd_accept)
 
@@ -1350,7 +1689,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("fsck", help="read-only integrity check of the store")
     sp.add_argument("--strict", action="store_true", help="fail on warnings/dangling objects")
     sp.add_argument("--json", action="store_true", help="machine-readable output")
+    sp.add_argument("--verify-signatures", action="store_true", help="also verify signatures")
+    sp.add_argument("--require-signatures", action="store_true",
+                    help="fail on unsigned/invalid accepted snapshots")
     sp.set_defaults(func=cmd_fsck)
+
+    sp = sub.add_parser("sign", help="sign a snapshot with the active identity")
+    sp.add_argument("object_id")
+    sp.set_defaults(func=cmd_sign)
+
+    sp = sub.add_parser("verify-signatures", help="verify all signatures in the store")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_verify_signatures)
+
+    sub.add_parser("trust-status", help="summary of signed/unsigned history and trust").set_defaults(func=cmd_trust_status)
 
     sp = sub.add_parser("gc", help="garbage-collect unreachable objects (safe, quarantined)")
     sp.add_argument("--dry-run", action="store_true", help="show what would be collected")

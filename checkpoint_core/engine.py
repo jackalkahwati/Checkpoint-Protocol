@@ -67,12 +67,21 @@ def generate_packet(repo: Repo, session: Session) -> Dict[str, Any]:
         next_action = "accept"
 
     agent = session.data.get("agent", {})
+    # identity / signature metadata (Phase 5)
+    signer_id = repo.current_identity_id()
+    identity_meta = {"signing_identity": signer_id, "fingerprint": None}
+    if signer_id:
+        idrec = util.read_json(repo.paths.identities / (signer_id + ".json"), None)
+        if idrec:
+            identity_meta["fingerprint"] = idrec.get("fingerprint")
+            identity_meta["type"] = idrec.get("type")
     packet = {
         "schema_version": 1,
         "generated_at": util.now_iso(),
         "session_id": session.id,
         "instruction": session.data.get("instruction"),
         "actor": session.actor(),
+        "identity": identity_meta,
         "agent": {"name": agent.get("name"), "model": agent.get("model"), "tool": agent.get("tool")},
         "branch": session.data["base"].get("branch"),
         "base_snapshot": session.base_head,

@@ -137,10 +137,37 @@ def export_bundle(repo: Repo, branch: str, out_path: Path) -> Dict[str, Any]:
         events = [e for e in util.read_jsonl(repo.paths.ledger) if e.get("session_id") in sessions or e.get("head") == head]
         ledger_bytes = ("\n".join(json.dumps(e) for e in events) + "\n").encode("utf-8")
         _add(tar, "ledger.jsonl", ledger_bytes)
+
+        # signatures for reachable snapshots (so the bundle is self-verifiable)
+        signer_ids = set()
+        for oid in sorted(oids):
+            sdir = repo.paths.signatures / oid
+            if sdir.exists():
+                for f in sorted(sdir.iterdir()):
+                    if f.is_file():
+                        _add(tar, "signatures/{}/{}".format(oid, f.name), f.read_bytes())
+                        rec = util.read_json(f, {})
+                        if rec.get("signer_identity_id"):
+                            signer_ids.add(rec["signer_identity_id"])
+
+        # PUBLIC identity records only — NEVER private keys (keys/ is never touched)
+        idents = 0
+        idir = repo.paths.identities
+        if idir.exists():
+            for f in sorted(idir.iterdir()):
+                if f.is_file() and f.suffix == ".json":
+                    rec = util.read_json(f, {})
+                    pub = dict(rec)
+                    pub.pop("trusted", None)  # trust is local; imports start untrusted
+                    _add(tar, "identities/{}".format(f.name),
+                         json.dumps(pub, indent=2).encode("utf-8"))
+                    idents += 1
+
         manifest = {"format": "checkpoint-core-bundle/1", "branch": branch,
-                    "head": head, "objects": len(oids), "exported_at": util.now_iso()}
+                    "head": head, "objects": len(oids), "identities": idents,
+                    "exported_at": util.now_iso()}
         _add(tar, "manifest.json", json.dumps(manifest, indent=2).encode("utf-8"))
-    return {"out_path": str(out_path), "objects": len(oids), "head": head}
+    return {"out_path": str(out_path), "objects": len(oids), "head": head, "identities": idents}
 
 
 def import_bundle(repo: Repo, bundle_path: Path, branch: Optional[str] = None) -> Dict[str, Any]:
@@ -160,10 +187,18 @@ def import_bundle(repo: Repo, bundle_path: Path, branch: Optional[str] = None) -
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     dest.write_bytes(data)
                     copied += 1
-            elif name.startswith("sessions/"):
+            elif name.startswith("sessions/") or name.startswith("signatures/"):
                 dest = repo.paths.base / name
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(data)
+            elif name.startswith("identities/"):
+                # import public identity records as UNTRUSTED (never auto-trust)
+                rec = json.loads(data.decode("utf-8"))
+                rec["trusted"] = False
+                rec.setdefault("revoked", False)
+                dest = repo.paths.identities / name.split("/", 1)[1]
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(json.dumps(rec, indent=2).encode("utf-8"))
             elif name == "ledger.jsonl":
                 have = {e["event_id"] for e in util.read_jsonl(repo.paths.ledger)}
                 for line in data.decode("utf-8").splitlines():

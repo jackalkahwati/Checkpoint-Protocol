@@ -164,7 +164,9 @@ checkpoint-core git-import ./legacy-repo # import a Git repo; Checkpoint becomes
 | `bundle export\|import` | Portable `.tar.gz` transport for offline sync. |
 | `git-export <dir>` / `git-import <dir>` | The Git bridge (the only Git-touching code). |
 | `verify-history` | Recompute SHA-256 seals across accepted history; flags tampering. |
-| `fsck [--strict --json]` | Read-only integrity check: hashes, seals, refs, trees, parents, sessions, renames. |
+| `identity create\|list\|show\|trust\|untrust\|revoke\|import\|export\|current\|use` | Manage Ed25519 signing identities and local trust. |
+| `sign <snapshot>` / `verify-signatures` / `trust-status` | Sign history, verify all signatures, summarize trust. |
+| `fsck [--strict --json --verify-signatures --require-signatures]` | Read-only integrity check: hashes, seals, refs, trees, parents, sessions, renames, signatures. |
 | `gc [--dry-run --aggressive --force]` | Safely collect unreachable, past-grace objects (fsck-gated, quarantined). |
 | `objects stats / list [--reachable\|--unreachable\|--type] / show <id>` | Inspect the object store. |
 | `doctor` | Diagnose the installation. |
@@ -251,6 +253,35 @@ checkpoint-core gc              # collect unreachable, past-grace objects (safel
 - **Reachability** is rebuilt from objects + refs + sessions every run — no authoritative
   index, so a stale index can never cause data loss. See §13 of the spec.
 
+## Authorship you can prove (signed identity & trust)
+
+Integrity (Phase 4) answers *"is the store intact?"* Signing answers *"who created this
+work, who approved it, and can that be verified?"* — the foundation for audit-grade and
+defense-grade AI development.
+
+```bash
+checkpoint-core identity create --name "Jack" --type human   # Ed25519 keypair
+checkpoint-core start "fix exposure" && ... && checkpoint-core accept -m "fix exposure"
+#   signed: yes by id_human_4893dc9f88ea34dc
+checkpoint-core verify-signatures      # every signature, cryptographically checked
+checkpoint-core trust-status           # signed vs unsigned history, trusted vs not
+```
+
+- **Ed25519 signatures** (RFC 8032). `accept` and `merge` sign automatically when an
+  identity is active; the signature is bound to the snapshot's tree, parents, session,
+  message, and verification summary. Change any of them and verification fails — change
+  Git-bridge provenance and it stays valid (provenance is excluded from the payload).
+- **Signatures are independent of the integrity seal**: the seal proves the object is
+  intact; the signature proves who accepted it.
+- **Trust is local.** You create trusted identities; **imported identities start
+  untrusted**. Revocation is local. **Trust policy** can require signed/trusted accepts and
+  forbid an **agent** from self-accepting — a human or CI must approve.
+- **Keys never leak.** Private keys live in `.checkpoint/keys/` (0600) and are never
+  exported, never bundled, never autosaved, never touched by gc/fsck. Bundles carry the
+  **public** identities + signatures so another machine can verify the trust chain.
+- Vendored pure-Python Ed25519 fallback means signing/verification work even without the
+  `cryptography` package — and with Git uninstalled. See §14 of the spec.
+
 ## How it works (native objects, no Git)
 
 - **Blob** — raw file bytes, addressed by `sha256(bytes)`.
@@ -274,8 +305,9 @@ shells out to `git`, and it is loaded lazily.
 
 Each accepted snapshot carries a `sha256-seal` binding its tree, parents, session,
 message, author, and timestamp. `checkpoint-core verify-history` recomputes the seals and
-reports any break. (Asymmetric **ed25519** signing is the documented production upgrade;
-the `algo` field makes it pluggable.)
+reports any break. On top of this integrity seal, accepted snapshots can also be
+cryptographically **signed with Ed25519** by an identity — see
+[Authorship you can prove](#authorship-you-can-prove-signed-identity--trust).
 
 ---
 
@@ -312,9 +344,9 @@ It is a bridge for adoption, not the protocol. See
 2. **Phase 2 (done):** background autosave daemon, timeline, and recovery.
 3. **Phase 3 (done):** native rename detection in diff, merge, history, and packets.
 4. **Phase 4 (done):** object GC + `fsck` — integrity checking and safe garbage collection.
-5. **Phase 5:** signed identity & trust (ed25519); remote protocol hardening.
-6. **Phase 6:** hosted Checkpoint service; agent integrations (Cursor, Claude Code, Codex,
-   Copilot); web UI; team policy/compliance.
+5. **Phase 5 (done):** signed identity & trust (Ed25519) — provable authorship and approval.
+6. **Phase 6:** remote protocol hardening; hosted Checkpoint service; agent integrations
+   (Cursor, Claude Code, Codex, Copilot); web UI; team policy/compliance.
 4. **Phase 4:** hosted Checkpoint service (same object model and sync verbs over HTTP).
 5. **Phase 5:** web UI for sessions, diffs, prompts, verification, approvals, rollback.
 6. **Phase 6:** team workflow, policy engine, compliance, audit, enterprise controls.

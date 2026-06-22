@@ -455,6 +455,10 @@ commit/snapshot ids differ because the object formats differ by design.
     remotes/<remote>/<branch>
   objects/
     <ab>/<sha256>        # blobs and structured objects (content-addressed)
+  identities/<id>.json   # public IdentityRecords (§14)
+  keys/<id>.key          # PRIVATE Ed25519 seeds, 0600 — never exported/captured/collected
+  signatures/<object-id>/<signature-id>.json   # external SignatureRecords (§14)
+  current_identity       # active signing identity id
   quarantine/<stamp>/    # gc holding area before permanent deletion (§13)
     <ab>/<sha256>
     manifest.json
@@ -675,7 +679,110 @@ for operators.
 
 ---
 
-## 14. Conformance
+## 14. Signed identity and trust (Phase 5)
+
+Phase 4 answers "is the object store intact?" Phase 5 answers **"who created this work, who
+approved it, and can that authorship be verified?"** — turning Checkpoint into an
+audit-grade AI development protocol. Signatures use **Ed25519** (RFC 8032).
+
+### Identities and keys
+
+An **identity** is a human, AI agent, CI runner, machine, or service that can sign protocol
+events. Public **IdentityRecords** live in `.checkpoint/identities/<id>.json`:
+
+```json
+{
+  "identity_id": "id_human_4893dc9f88ea34dc",
+  "name": "Jack", "type": "human",
+  "public_key": "<hex 32 bytes>", "key_algorithm": "ed25519",
+  "fingerprint": "SHA256:<hex>", "created_at": "...",
+  "labels": [], "capabilities": ["sign", "accept", "merge", "tag"],
+  "revoked": false, "revoked_at": null,
+  "trusted": true, "metadata": {"email": "..."}
+}
+```
+
+Private keys are raw 32-byte Ed25519 seeds stored under `.checkpoint/keys/<id>.key` with
+`0600` permissions. They are **never** exported, **never** placed in bundles, **never**
+captured by autosave (the whole `.checkpoint/` store is excluded from the working-tree
+scan), and **never** seen by gc/fsck reachability (they are not objects). Secret scanning
+flags private keys accidentally added to the working tree; `identity show`/fsck warn on
+unsafe key-file permissions.
+
+### Signatures (stored externally)
+
+Signatures are **not** embedded in the immutable content-addressed object (that would
+change its id and prevent post-hoc signing). They live under
+`.checkpoint/signatures/<object_id>/<signature_id>.json` as **SignatureRecords**:
+
+```json
+{
+  "signature_id": "sig_...", "signer_identity_id": "id_...",
+  "signer_fingerprint": "SHA256:...", "algorithm": "ed25519",
+  "signed_at": "...", "signed_object_type": "snapshot",
+  "signed_object_id": "<sha256>", "canonicalization_version": 1,
+  "protocol_version": "0.5", "signature": "<hex 64 bytes>",
+  "public_key_hint": "<hex public key>"
+}
+```
+
+### Canonicalization
+
+The signed payload is a deterministic, canonical-JSON subset (sorted keys, UTF-8) of
+**identity-affecting** fields only. It **excludes** bridge provenance, local paths, caches,
+mtimes, and transient fsck/gc reports. For an accepted/merge snapshot:
+
+```
+{ canonicalization_version, protocol_version, signed_object_type:"snapshot",
+  snapshot_id, tree_id, parent_ids, session_id, message,
+  author_identity_id, acceptor_identity_id, verification, timestamp, seal_algorithm }
+```
+
+Verification **rebuilds** this payload from the current object and checks the signature, so
+any change to message, tree, parents, session, or verification summary invalidates it —
+while a change to `bridge` provenance does **not** (it is excluded). The integrity
+**seal** (§6) and the Ed25519 **signature** are independent: the seal proves the object is
+intact, the signature proves who accepted it.
+
+### Trust store and policy
+
+Trust is **local**: each IdentityRecord carries a `trusted` flag. Locally-created
+identities are trusted; **imported identities start untrusted** (importing never implies
+trust). Revocation is represented locally (`revoked`). Trust policy (`trust:` config) gates
+acceptance:
+
+```yaml
+trust:
+  require_signed_accepts: false      # accept must be signed
+  require_trusted_acceptor: false    # acceptor must be locally trusted
+  require_signed_merges: false
+  require_signed_tags: true
+  allow_unsigned_sessions: true
+  allowed_acceptor_types: [human, ci]
+  allowed_agent_accept: false        # agents cannot self-accept
+  sign_snapshots: false              # also sign manual snapshots
+```
+
+### Default behavior and integration
+
+- Signing is **available but not mandatory** by default. If a signing identity is active,
+  `accept` and `merge` sign automatically; `--no-sign` opts out, `snapshot --sign` signs a
+  manual snapshot. `start` records the active signing identity on the session.
+- `verify-signatures` verifies every SignatureRecord; `trust-status` summarizes unsigned
+  accepted snapshots and signatures by trusted/untrusted/unknown/revoked signers.
+- `fsck --verify-signatures` includes signature findings; `fsck --require-signatures`
+  **fails** on unsigned, invalid, or revoked-signer accepted snapshots; `--json` includes
+  the findings.
+- `packet` includes identity + signature metadata. **Bundles** carry the public identity
+  records and signatures needed to verify the exported history — **never private keys** —
+  and imported identities arrive untrusted.
+
+Commands: `identity create|list|show|trust|untrust|revoke|import|export|current|use|set`,
+`sign <snapshot>`, `verify-signatures`, `trust-status`.
+
+---
+
+## 15. Conformance
 
 An implementation conforms to Checkpoint Core Protocol 0.1 if it:
 
@@ -699,5 +806,10 @@ An implementation conforms to Checkpoint Core Protocol 0.1 if it:
 10. Provides read-only **fsck** integrity checking and **gc** that deletes only unreachable,
     past-grace objects, never touching reachable/accepted history, runs fsck first, and
     quarantines before permanent deletion (§13).
-11. Passes the test: **with Git uninstalled, all of the above — including the autosave
-    daemon, timeline, recovery, rename detection, fsck, and gc — still work.**
+11. Supports **Ed25519 signed identities and trust** (§14): signs accepts/merges with the
+    active identity, verifies signatures by rebuilding a canonical payload that excludes
+    bridge provenance, keeps private keys out of exports/autosave/gc, imports identities as
+    untrusted, and enforces trust policy. Signatures are independent of integrity seals.
+12. Passes the test: **with Git uninstalled, all of the above — including the autosave
+    daemon, timeline, recovery, rename detection, fsck, gc, and signing/verification —
+    still work.**

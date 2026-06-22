@@ -49,9 +49,9 @@ def test_init_creates_native_store_without_git(repo):
 
 def test_identity_set_and_show(repo, capsys):
     run(["init"])
-    assert run(["identity", "--name", "Jack", "--email", "jack@e.com"]) == 0
+    assert run(["identity", "set", "--name", "Jack", "--email", "jack@e.com"]) == 0
     capsys.readouterr()
-    run(["identity"])
+    run(["identity", "current"])      # falls back to the legacy author when unsigned
     out = capsys.readouterr().out
     assert "jack@e.com" in out
 
