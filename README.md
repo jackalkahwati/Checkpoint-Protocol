@@ -411,6 +411,11 @@ works offline), and a richer **Next.js** review app in [`frontend/`](frontend/) 
 that talks to the server's `/ui/*` backend-for-frontend adapter (CORS enabled) and falls back
 to mock data offline.
 
+**Merge requests** close the loop into a real team review: open an MR from a reviewed session,
+read the rename-aware diff, leave **inline line comments**, **approve** (with policy
+`min_approvals` enforcement), and **merge** — server-signed, conflict-aware, and atomic, so
+two people can't destroy each other's work. See [`docs/reviews.md`](docs/reviews.md).
+
 The **session review page** puts the whole work episode on one screen — instruction,
 agent/model/tool, timeline, rename-aware diff, packet, policy decision (allow/deny + reasons
 + required actions), signatures & trust (signer identity/type, trusted/untrusted/unknown/
@@ -491,11 +496,13 @@ It is a bridge for adoption, not the protocol. See
    transfer, server-side policy, and audit; the protocol foundation for hosted Checkpoint.
 9. **Phase 9 (done):** web review UI — review work sessions (prompt → diff → policy →
    signatures → accept) in the browser, served by the API.
-10. **Next:** agent integrations (Cursor, Claude Code, Codex, Copilot); public developer
-    preview (v1.0).
-4. **Phase 4:** hosted Checkpoint service (same object model and sync verbs over HTTP).
-5. **Phase 5:** web UI for sessions, diffs, prompts, verification, approvals, rollback.
-6. **Phase 6:** team workflow, policy engine, compliance, audit, enterprise controls.
+10. **v1.0-preview (now):** packaging, demos, docs, diagnostics — plus **merge requests with
+    approvals + inline comments**. A usable AI-native VCS preview, not just a prototype.
+
+After the preview, the ordered roadmap is **v1.1** review-workflow polish → **v1.2**
+production self-hosting hardening (multi-process/TLS) → **v1.3** agent integrations →
+**v1.4** AI-assisted conflict resolution → **v1.5** semantic-merge *preview* → **v2.0** hosted
+cloud product. Full detail in [`ROADMAP.md`](ROADMAP.md).
 
 ## Development
 

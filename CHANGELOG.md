@@ -2,6 +2,19 @@
 
 All notable changes to Checkpoint. Versions are tagged in Git.
 
+## v1.0-preview — Public Developer Preview (review loop)
+- **Merge requests**: open from a reviewed session → diff + mergeability → review thread →
+  approvals → server-signed, conflict-aware, atomic merge. Inline per-line diff comments;
+  approvals gated by policy `min_approvals` (now enforced on merge, not just accept).
+- Web: "Merge requests" tab + MR detail page; repos **list view** toggle; Identities
+  **Trust/Untrust/Revoke** wired; fast dashboard (light integrity on list).
+- CLI/ops: `checkpoint-core setup` one-shot repo setup; secret-scan allowlist
+  (`.checkpoint/secrets-allow`); autosave watcher auto-runs during a session; `push` returns
+  a real exit code; `remote list` shows HTTP URLs; symlink-safe launchers.
+- Server: `/ui/*` backend-for-frontend adapter + CORS for the Next.js frontend; hosted push
+  judged by the snapshot's signer; fsck no longer warns on JSON blobs.
+- Docs: `docs/reviews.md`; updated ROADMAP (v1.0→v2.0 ordered).
+
 ## v1.0.0-preview — Public Developer Preview
 - Packaging & metadata (pyproject classifiers, console scripts, optional `crypto`/`dev` extras).
 - `checkpoint-core version` / `checkpoint-server version` (CLI/protocol/store versions, features).

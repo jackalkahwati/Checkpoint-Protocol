@@ -21,7 +21,14 @@ Or run from source with `export PATH="$PWD/bin:$PATH"`. See `docs/quickstart.md`
 
 ## Highlights since v0.1
 core VCS → autosave/recovery → rename-aware merge → integrity+GC → signed trust →
-remote sync → policy engine → hosted API → web review UI. **Works with Git uninstalled.**
+remote sync → policy engine → hosted API → web review UI → **merge requests with approvals
++ inline comments**. **Works with Git uninstalled.**
+
+This release crosses from "protocol prototype" to a **usable AI-native VCS preview**: work
+happens in signed, reviewable sessions, and teams review + land it through merge requests
+(rename-aware diff, inline line comments, approvals gated by policy `min_approvals`, and a
+server-signed, conflict-aware, atomic merge). See `docs/reviews.md`. Ordered next steps in
+`ROADMAP.md` (v1.1 review polish → v1.2 self-hosting → v1.3 agents → …).
 
 ## Known limitations (honest)
 - Public preview, **not** a production cloud service.
