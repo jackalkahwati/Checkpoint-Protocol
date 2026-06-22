@@ -782,7 +782,84 @@ Commands: `identity create|list|show|trust|untrust|revoke|import|export|current|
 
 ---
 
-## 15. Conformance
+## 15. Remote sync (Phase 6)
+
+Checkpoint repositories exchange state between machines **without trusting the remote**. A
+remote may advertise refs and object ids, but the receiver verifies object hashes, schemas,
+seals, parent chains, reachability, and (optionally) signatures **before any ref moves**.
+Remote types in this version are **filesystem** (a directory holding a Checkpoint store)
+and **bundle** (a portable `.tar.gz`); the model is designed so HTTP remotes can be added
+later. No Git is involved.
+
+### Core rule: verify before refs move
+
+- **Object transfer is content-addressed and verified.** Every received object's
+  `sha256(bytes)` must equal its id, or it is skipped; the ref is not updated unless the
+  full received closure verifies.
+- **Local refs never move on receive until verification completes**; **remote refs never
+  move until object transfer completes**. Ref writes are **atomic** (temp file → fsync →
+  rename).
+- A receiver rejects: objects whose id≠content, refs to missing/non-snapshot objects,
+  broken parent chains, invalid seals, failed signatures (when required), private-key
+  material, path traversal, and malformed manifests.
+
+### Refs and tracking
+
+- `fetch` copies objects and writes **remote-tracking refs** `refs/remotes/<remote>/<branch>`
+  — it never changes local branch heads. Remote-tracking refs are part of gc reachability,
+  so fetched-but-unmerged data is never collected.
+- `pull` = fetch + verify, then **fast-forward** the local branch if safe, else refuse and
+  instruct the user to `merge`. A ref update is **fast-forward** iff the old target is an
+  ancestor of the new target through accepted-snapshot parent chains.
+- `push` computes the objects the remote is missing, sends only those (verified), then
+  atomically updates the remote ref. Non-fast-forward is **rejected by default**;
+  `--force-with-lease[=<expected>]` succeeds only if the remote head still equals the
+  expected value (the local remote-tracking ref by default).
+
+### What transfers
+
+Accepted history (snapshots/trees/blobs), the objects sessions reference (base trees,
+intermediate snapshots, verification/packet trees), **signatures**, **public identities**
+(imported **untrusted**), and selected session artifacts. **Never** transferred: private
+keys (always), and **autosaves** unless explicitly enabled (`sync.transfer_autosaves` or a
+flag). Bridge provenance remains non-identity-affecting and never invalidates signatures.
+
+### Bundles
+
+`bundle create` writes a portable archive (manifest, objects, refs, tags, sessions,
+signatures, public identities, ledger subset) with a `manifest_hash`. `bundle verify`
+extracts to a temp area and checks **path safety** (no absolute paths, no `..`, no escaping
+symlinks), rejects **private-key material** (`keys/`, `*.key`, PEM private-key content),
+parses the manifest, verifies object hashes, and verifies that refs/tags resolve to valid
+accepted snapshots (and signatures when requested) — **before** anything is moved into the
+store. `bundle import` runs that verification first and only then copies objects and writes
+refs. `clone` accepts either a filesystem store or a bundle.
+
+### Config
+
+```yaml
+remotes:
+  origin: { type: filesystem, path: ../remote-repo, require_signed_snapshots: false }
+sync:
+  verify_before_ref_update: true
+  require_fast_forward: true
+  allow_force_push: false
+  transfer_sessions: true
+  transfer_autosaves: false
+  transfer_verification_records: true
+  transfer_packets: true
+  transfer_public_identities: true
+  max_bundle_size_mb: 500
+```
+
+Commands: `remote add|list|show|remove`, `fetch`, `pull`, `push`, `clone`,
+`sync status`, `bundle create|verify|import`. `--dry-run` (fetch/pull/push) changes
+nothing; `--json` is available on fetch/push/sync status/bundle verify. Sync events are
+recorded in the ledger.
+
+---
+
+## 16. Conformance
 
 An implementation conforms to Checkpoint Core Protocol 0.1 if it:
 
@@ -810,6 +887,11 @@ An implementation conforms to Checkpoint Core Protocol 0.1 if it:
     active identity, verifies signatures by rebuilding a canonical payload that excludes
     bridge provenance, keeps private keys out of exports/autosave/gc, imports identities as
     untrusted, and enforces trust policy. Signatures are independent of integrity seals.
-12. Passes the test: **with Git uninstalled, all of the above — including the autosave
-    daemon, timeline, recovery, rename detection, fsck, gc, and signing/verification —
-    still work.**
+12. Performs **hardened remote sync** (§15) that never trusts the remote: content-verified
+    transfer, fetch into remote-tracking refs, fast-forward-by-default pull, safe push with
+    `--force-with-lease`, atomic ref updates, and bundle verification (path-safety,
+    private-key rejection, manifest/seal/signature checks) — verifying everything before
+    refs move and never transferring private keys.
+13. Passes the test: **with Git uninstalled, all of the above — including the autosave
+    daemon, timeline, recovery, rename detection, fsck, gc, signing/verification, and
+    remote sync — still work.**

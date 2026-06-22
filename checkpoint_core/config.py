@@ -70,6 +70,17 @@ def default_config(project: str = "") -> Dict[str, Any]:
             "allowed_agent_accept": False,
             "sign_snapshots": False,
         },
+        "sync": {
+            "verify_before_ref_update": True,
+            "require_fast_forward": True,
+            "allow_force_push": False,
+            "transfer_sessions": True,
+            "transfer_autosaves": False,
+            "transfer_verification_records": True,
+            "transfer_packets": True,
+            "transfer_public_identities": True,
+            "max_bundle_size_mb": 500,
+        },
     }
 
 
@@ -139,6 +150,9 @@ class Config:
 
     def trust(self) -> Dict[str, Any]:
         return self.data.get("trust", {}) or {}
+
+    def sync(self) -> Dict[str, Any]:
+        return self.data.get("sync", {}) or {}
 
     def risk_rules_for(self, tags: List[str]) -> Dict[str, Any]:
         rules = self.data.get("risk_rules", {}) or {}

@@ -127,7 +127,7 @@ def compute_reachable(repo: Repo, aggressive: bool = False,
         for p in snap.get("parents", []) or []:
             visit_snap(p, "parent of {}".format(sid))
 
-    # refs/heads + refs/tags
+    # refs/heads + refs/tags (and refs/remotes/* so fetched-but-unmerged data survives gc)
     for kind_dir in ("heads", "tags"):
         d = repo.paths.base / "refs" / kind_dir
         if d.exists():
@@ -136,6 +136,13 @@ def compute_reachable(repo: Repo, aggressive: bool = False,
                     refs_scanned += 1
                     visit_snap(ref.read_text(encoding="utf-8").strip() or None,
                                "ref {}/{}".format(kind_dir, ref.name))
+    remotes_dir = repo.paths.base / "refs" / "remotes"
+    if remotes_dir.exists():
+        for ref in sorted(remotes_dir.rglob("*")):
+            if ref.is_file():
+                refs_scanned += 1
+                rel = ref.relative_to(repo.paths.base / "refs")
+                visit_snap(ref.read_text(encoding="utf-8").strip() or None, "ref {}".format(rel))
 
     active = repo.active_session_id()
     for sid in repo.session_ids():

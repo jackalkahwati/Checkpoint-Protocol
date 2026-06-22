@@ -191,11 +191,11 @@ def test_push_pull_between_repos(tmp_path, monkeypatch):
     monkeypatch.chdir(a); run(["init", "--email", "j@e.com"])
     (a / "f.txt").write_text("v1\n")
     run(["start", "c1"]); run(["accept", "--no-verify", "-m", "c1"])
-    run(["remote", "add", "origin", "--location", str(b)])
+    run(["remote", "add", "origin", "--type", "filesystem", "--path", str(b)])
     assert run(["push", "origin", "main"]) == 0
     # clone via pull into c
     monkeypatch.chdir(c); run(["init", "--email", "c@e.com"])
-    run(["remote", "add", "origin", "--location", str(b)])
+    run(["remote", "add", "origin", "--type", "filesystem", "--path", str(b)])
     assert run(["pull", "origin", "main"]) == 0
     assert (c / "f.txt").read_text() == "v1\n"
     from checkpoint_core.store import Repo

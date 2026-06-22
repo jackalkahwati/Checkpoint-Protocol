@@ -15,7 +15,7 @@ from . import __version__, objects, util
 from . import autosave as autosavemod, engine, ledger as ledgermod
 from . import fsck as fsckmod, gc as gcmod, reachable as reachablemod
 from . import identity as idmod, merge as mergemod, secrets as secretscan
-from . import sign as signmod, timeline as timelinemod
+from . import remote as remotemod, sign as signmod, timeline as timelinemod
 from . import sync as syncmod, verify as verifymod
 from .watcher import Watcher
 from .config import Config, default_config
@@ -845,63 +845,211 @@ def cmd_merge(args) -> int:
     return 0
 
 
-# ------------------------------------------------------------------------ remotes
+# --------------------------------------------------- remotes / sync (Phase 6)
 
 def cmd_remote(args) -> int:
     repo = _repo()
-    if args.remote_cmd == "add":
-        cfg = repo.config
-        cfg.data.setdefault("remotes", {})[args.name] = {"type": args.type, "location": args.location}
-        cfg.save()
-        info(util.green("Added remote ") + "{} ({}: {})".format(args.name, args.type, args.location))
+    sub = args.remote_cmd or "list"
+    if sub == "add":
+        remotemod.add_remote(repo, args.name, args.type, args.path,
+                             require_signed_snapshots=False)
+        info(util.green("Added remote ") + "{} ({}: {})".format(args.name, args.type, args.path))
         return 0
-    remotes = repo.config.remotes()
+    if sub == "remove":
+        if remotemod.remove_remote(repo, args.name):
+            info(util.green("Removed remote ") + args.name + util.dim(" (config only; data untouched)"))
+            return 0
+        err("no such remote: {}".format(args.name))
+        return 1
+    if sub == "show":
+        spec = remotemod.get_remote(repo, args.name)
+        if not spec:
+            err("no such remote: {}".format(args.name))
+            return 1
+        info(util.bold("Remote ") + util.cyan(args.name))
+        info("  type: {}".format(spec.get("type")))
+        info("  path: {}".format(spec.get("path")))
+        try:
+            st = remotemod.sync_status(repo, args.name)
+            for b in st["branches"]:
+                info("  {:<16} {}".format(b["branch"], b["relationship"]))
+        except Exception as exc:
+            info(util.yellow("  (remote unreachable: {})".format(exc)))
+        return 0
+    remotes = remotemod.list_remotes(repo)
     if not remotes:
-        info("No remotes configured. Add one: checkpoint-core remote add <name> --type path --location <dir>")
+        info("No remotes. Add one: checkpoint-core remote add <name> --type filesystem --path <dir>")
         return 0
     for name, spec in remotes.items():
-        info("{:<16} {}: {}".format(name, spec.get("type"), spec.get("location")))
+        info("{:<16} {}: {}".format(name, spec.get("type"), spec.get("path")))
     return 0
 
 
-def _resolve_remote(repo: Repo, name: str) -> Repo:
-    spec = repo.config.remotes().get(name)
-    if not spec:
-        raise SystemExit(util.red("error: ") + "no such remote: {}".format(name))
-    if spec.get("type") != "path":
-        raise SystemExit(util.red("error: ") + "only 'path' remotes are supported in the MVP")
-    loc = Path(spec["location"])
-    remote = Repo(loc)
-    if not remote.initialized:
-        raise SystemExit(util.red("error: ") + "remote store is not initialized: {}".format(loc))
-    return remote
-
-
-def cmd_push(args) -> int:
+def cmd_fetch(args) -> int:
     repo = _repo()
-    remote = _resolve_remote(repo, args.remote)
-    branch = args.branch or repo.head_branch()
-    res = syncmod.push(repo, remote, branch)
-    ledgermod.append(repo, "push", None, repo.identity(),
-                     {"remote": args.remote, "branch": branch, "objects": res["objects_copied"]})
-    info(util.green("Pushed ") + "{} -> {}: {} objects, head {}".format(
-        branch, args.remote, res["objects_copied"], _short(res["head"])))
+    try:
+        report = remotemod.fetch(repo, args.remote, branches=[args.branch] if args.branch else None,
+                                 tags=args.tags, verify_signatures=args.verify_signatures,
+                                 dry_run=args.dry_run)
+    except ValueError as exc:
+        err(str(exc))
+        return 1
+    if not args.dry_run:
+        ledgermod.append(repo, "fetch", None, repo.identity(),
+                         {"remote": args.remote, "objects": report["objects_copied"],
+                          "refs": report["refs_updated"]})
+    if args.json:
+        print(_dump(report))
+        return 1 if report["errors"] else 0
+    info(util.bold("fetch {}{}".format(args.remote, " (dry-run)" if args.dry_run else "")))
+    for b in report["branches"]:
+        info("  {}: {} ({} missing)".format(b["branch"], b.get("status", "planned"), b["missing"]))
+    if report["errors"]:
+        for e in report["errors"]:
+            info(util.red("  ERROR " + e))
+        return 1
+    info("  objects copied: {}".format(report["objects_copied"]))
     return 0
 
 
 def cmd_pull(args) -> int:
     repo = _repo()
-    remote = _resolve_remote(repo, args.remote)
+    branch = args.branch or getattr(args, "branch_opt", None) or repo.head_branch()
+    try:
+        res = remotemod.pull(repo, args.remote, branch,
+                             verify_signatures=args.verify_signatures, dry_run=args.dry_run)
+    except ValueError as exc:
+        err(str(exc))
+        return 1
+    if not args.dry_run and res.get("updated"):
+        if repo.head_branch() == branch:
+            materialize(repo, repo.get_object(res["new_head"])["tree"], delete_extra=True)
+        ledgermod.append(repo, "pull", None, repo.identity(),
+                         {"remote": args.remote, "branch": branch, "head": res.get("new_head")})
+    if args.json:
+        print(_dump(res))
+    status = res.get("status")
+    if status == "dry-run":
+        info("pull (dry-run): {} is {} relative to {}".format(
+            branch, res.get("relationship"), args.remote))
+        return 0
+    if status == "fast-forward":
+        info(util.green("Pulled (fast-forward) ") + "{} -> {}".format(branch, _short(res["new_head"])))
+    elif status == "up-to-date":
+        info(util.green("Already up to date."))
+    elif status == "diverged":
+        err("local and remote '{}' have diverged. Run `checkpoint-core merge` after fetch.".format(branch))
+        return 1
+    else:
+        info(util.yellow("pull: {}".format(status)))
+        if res.get("fetch", {}).get("errors"):
+            for e in res["fetch"]["errors"]:
+                info(util.red("  " + e))
+        return 1
+    return 0
+
+
+def cmd_push(args) -> int:
+    repo = _repo()
     branch = args.branch or repo.head_branch()
-    res = syncmod.pull(repo, remote, branch)
-    # update working tree if we are on that branch
-    if repo.head_branch() == branch:
-        tree = repo.get_object(res["head"])["tree"]
-        materialize(repo, tree, delete_extra=True)
-    ledgermod.append(repo, "pull", None, repo.identity(),
-                     {"remote": args.remote, "branch": branch, "objects": res["objects_copied"]})
-    info(util.green("Pulled ") + "{} <- {}: {} objects, head {}".format(
-        branch, args.remote, res["objects_copied"], _short(res["head"])))
+    try:
+        res = remotemod.push(repo, args.remote, branch, tags=args.tags,
+                             force_with_lease=args.force_with_lease, dry_run=args.dry_run)
+    except ValueError as exc:
+        err(str(exc))
+        return 1
+    if not args.dry_run and res.get("status") == "pushed":
+        ledgermod.append(repo, "push", None, repo.identity(),
+                         {"remote": args.remote, "branch": branch,
+                          "objects": res.get("objects_sent", 0), "forced": res.get("forced")})
+    if args.json:
+        print(_dump(res))
+    status = res.get("status")
+    if status == "pushed":
+        info(util.green("Pushed ") + "{} -> {}: {} objects{}".format(
+            branch, args.remote, res.get("objects_sent", 0), " (forced)" if res.get("forced") else ""))
+        return 0
+    if status == "would-push":
+        info("would push {} object(s) to {}/{}".format(res["missing_on_remote"], args.remote, branch))
+        return 0
+    if status == "rejected-non-fast-forward":
+        err("non-fast-forward: remote '{}' has commits you don't have. Pull, or use --force-with-lease.".format(branch))
+        return 1
+    if status == "rejected-stale-lease":
+        err("--force-with-lease rejected: remote moved (expected {}, found {}).".format(
+            _short(res.get("expected")), _short(res.get("remote_head"))))
+        return 1
+    info(util.yellow("push: {}".format(status)))
+    return 0
+
+
+def cmd_clone(args) -> int:
+    dest = Path(args.dest)
+    if dest.exists() and any(dest.iterdir()):
+        err("destination exists and is not empty: {}".format(dest))
+        return 1
+    src = args.source
+    # bundle clone vs filesystem clone
+    if Path(src).is_file():
+        repo = remotemod.bootstrap_store(dest)
+        res = syncmod.import_bundle(repo, Path(src), require_signatures=args.verify_signatures)
+        if not res.get("ok"):
+            err("bundle verification failed:")
+            for e in res.get("errors", [])[:20]:
+                info(util.red("  " + e))
+            return 1
+        branch = res.get("branch") or "main"
+    else:
+        srepo = Repo(Path(src))
+        if not srepo.initialized:
+            err("source is neither a bundle file nor an initialized Checkpoint store: {}".format(src))
+            return 1
+        branch = srepo.head_branch() or srepo.config.default_branch()
+        repo = remotemod.bootstrap_store(dest, branch)
+        remotemod.add_remote(repo, "origin", "filesystem", str(Path(src).resolve()))
+        report = remotemod.fetch(repo, "origin", tags=True, verify_signatures=args.verify_signatures)
+        if report["errors"]:
+            err("clone verification failed:")
+            for e in report["errors"][:20]:
+                info(util.red("  " + e))
+            return 1
+        # set local branches from fetched remote-tracking refs
+        rdir = repo.paths.base / "refs" / "remotes" / "origin"
+        if rdir.exists():
+            for rf in rdir.iterdir():
+                if rf.is_file():
+                    repo.update_ref("refs/heads/{}".format(rf.name), rf.read_text(encoding="utf-8").strip())
+    # checkout default branch
+    head = repo.read_ref("refs/heads/{}".format(branch))
+    if head:
+        repo.set_head_to_branch(branch)
+        materialize(repo, repo.get_object(head)["tree"], delete_extra=True)
+    ledgermod.append(repo, "clone", None, repo.identity(), {"source": str(src), "branch": branch})
+    info(util.green("Cloned ") + "{} -> {} (branch {})".format(src, dest, branch))
+    return 0
+
+
+def cmd_sync(args) -> int:
+    repo = _repo()
+    if args.sync_cmd != "status":
+        err("usage: checkpoint-core sync status <remote>")
+        return 2
+    try:
+        st = remotemod.sync_status(repo, args.remote, args.branch)
+    except ValueError as exc:
+        err(str(exc))
+        return 1
+    if args.json:
+        print(_dump(st))
+        return 0
+    info(util.bold("sync status: {}".format(args.remote)))
+    for b in st["branches"]:
+        rel = b["relationship"]
+        color = {"up-to-date": util.green, "ahead": util.cyan, "behind": util.yellow,
+                 "diverged": util.red}.get(rel, lambda x: x)
+        info("  {:<16} {:<22} local={} remote={}  (-{} +{})".format(
+            b["branch"], color(rel), _short(b["local_head"]), _short(b["remote_head"]),
+            b["missing_locally"], b["missing_remotely"]))
     return 0
 
 
@@ -909,16 +1057,37 @@ def cmd_pull(args) -> int:
 
 def cmd_bundle(args) -> int:
     repo = _repo()
-    if args.bundle_cmd == "export":
-        branch = args.branch or repo.head_branch()
-        out = args.out or "{}.ckpt-bundle.tar.gz".format(branch)
-        res = syncmod.export_bundle(repo, branch, Path(out))
-        info(util.green("Exported bundle ") + "{} ({} objects) -> {}".format(branch, res["objects"], res["out_path"]))
+    sub = args.bundle_cmd
+    if sub in ("create", "export"):
+        out = args.out or "{}.ckpt-bundle.tar.gz".format(args.branch or repo.head_branch() or "checkpoint")
+        res = syncmod.create_bundle(repo, Path(out), branch=args.branch,
+                                    tags=getattr(args, "tags", False),
+                                    include_sessions=not getattr(args, "no_sessions", False))
+        info(util.green("Created bundle ") + "{} ({} objects, refs {}) -> {}".format(
+            res["out_path"], res["objects"], ",".join(res["refs"]) or "-", res["out_path"]))
         return 0
-    if args.bundle_cmd == "import":
-        res = syncmod.import_bundle(repo, Path(args.path), args.branch)
-        info(util.green("Imported bundle ") + "branch {} ({} new objects), head {}".format(
-            res["branch"], res["objects_copied"], _short(res["head"])))
+    if sub == "verify":
+        rep = syncmod.verify_bundle(Path(args.path), require_signatures=args.verify_signatures)
+        if args.json:
+            print(_dump(rep))
+            return 0 if rep["ok"] else 1
+        if rep["ok"]:
+            info(util.green("Bundle OK: ") + "refs {}".format(", ".join(rep["refs"].keys()) or "-"))
+            return 0
+        err("bundle verification FAILED:")
+        for e in rep["errors"][:30]:
+            info(util.red("  " + e))
+        return 1
+    if sub == "import":
+        res = syncmod.import_bundle(repo, Path(args.path), args.name,
+                                    require_signatures=args.verify_signatures)
+        if not res.get("ok"):
+            err("bundle verification failed; nothing imported:")
+            for e in res.get("errors", [])[:30]:
+                info(util.red("  " + e))
+            return 1
+        info(util.green("Imported bundle ") + "({} new objects), refs {}, head {}".format(
+            res["objects_copied"], ",".join(res["refs"]) or "-", _short(res["head"])))
         return 0
     err("unknown bundle subcommand")
     return 2
@@ -1620,28 +1789,73 @@ def build_parser() -> argparse.ArgumentParser:
     rsub = sp.add_subparsers(dest="remote_cmd")
     radd = rsub.add_parser("add")
     radd.add_argument("name")
-    radd.add_argument("--type", default="path", choices=["path"])
-    radd.add_argument("--location", required=True)
+    radd.add_argument("--type", default="filesystem", choices=["filesystem"])
+    radd.add_argument("--path", required=True)
+    rsub.add_parser("list")
+    rsh = rsub.add_parser("show"); rsh.add_argument("name")
+    rrm = rsub.add_parser("remove"); rrm.add_argument("name")
     sp.set_defaults(func=cmd_remote, remote_cmd=None)
 
-    sp = sub.add_parser("push", help="push a branch to a remote")
+    sp = sub.add_parser("fetch", help="fetch objects + remote-tracking refs (no branch change)")
     sp.add_argument("remote")
-    sp.add_argument("branch", nargs="?")
-    sp.set_defaults(func=cmd_push)
+    sp.add_argument("--branch")
+    sp.add_argument("--tags", action="store_true")
+    sp.add_argument("--verify-signatures", action="store_true")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_fetch)
 
-    sp = sub.add_parser("pull", help="pull a branch from a remote")
+    sp = sub.add_parser("pull", help="fetch + verify + fast-forward (or refuse if diverged)")
     sp.add_argument("remote")
     sp.add_argument("branch", nargs="?")
+    sp.add_argument("--branch", dest="branch_opt")  # tolerated alias
+    sp.add_argument("--verify-signatures", action="store_true")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_pull)
 
-    sp = sub.add_parser("bundle", help="export/import a portable bundle")
+    sp = sub.add_parser("push", help="push objects + update remote ref safely")
+    sp.add_argument("remote")
+    sp.add_argument("branch", nargs="?")
+    sp.add_argument("--tags", action="store_true")
+    sp.add_argument("--force-with-lease", nargs="?", const="", default=None)
+    sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_push)
+
+    sp = sub.add_parser("clone", help="create a local repo from a remote store or bundle")
+    sp.add_argument("source")
+    sp.add_argument("dest")
+    sp.add_argument("--verify-signatures", action="store_true")
+    sp.set_defaults(func=cmd_clone)
+
+    sp = sub.add_parser("sync", help="sync status against a remote")
+    ssub = sp.add_subparsers(dest="sync_cmd")
+    sst = ssub.add_parser("status")
+    sst.add_argument("remote")
+    sst.add_argument("--branch")
+    sst.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_sync, sync_cmd=None)
+
+    sp = sub.add_parser("bundle", help="create/verify/import a portable bundle")
     bsub = sp.add_subparsers(dest="bundle_cmd")
-    bex = bsub.add_parser("export")
+    bcr = bsub.add_parser("create")
+    bcr.add_argument("--out")
+    bcr.add_argument("--branch")
+    bcr.add_argument("--tags", action="store_true")
+    bcr.add_argument("--no-sessions", action="store_true")
+    bex = bsub.add_parser("export")    # legacy alias
     bex.add_argument("branch", nargs="?")
     bex.add_argument("--out")
+    bex.add_argument("--tags", action="store_true")
+    bvf = bsub.add_parser("verify")
+    bvf.add_argument("path")
+    bvf.add_argument("--verify-signatures", action="store_true")
+    bvf.add_argument("--json", action="store_true")
     bim = bsub.add_parser("import")
     bim.add_argument("path")
-    bim.add_argument("--branch")
+    bim.add_argument("--name")
+    bim.add_argument("--verify-signatures", action="store_true")
     sp.set_defaults(func=cmd_bundle, bundle_cmd=None)
 
     sp = sub.add_parser("git-export", help="bridge: replay history into a Git repo")

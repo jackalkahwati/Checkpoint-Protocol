@@ -9,7 +9,8 @@ from .store import Repo
 EVENT_TYPES = {
     "init", "identity", "session_start", "snapshot", "autosave", "verification",
     "packet", "accept", "reject", "rollback", "branch", "checkout", "merge",
-    "push", "pull", "git_import", "git_export", "gc", "sign", "trust",
+    "push", "pull", "fetch", "clone", "remote", "git_import", "git_export",
+    "gc", "sign", "trust",
 }
 
 

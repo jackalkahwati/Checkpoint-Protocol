@@ -122,10 +122,10 @@ checkpoint-core branch feature && checkpoint-core checkout feature
 # ... work, accept ...
 checkpoint-core checkout main && checkpoint-core merge feature
 
-checkpoint-core remote add origin --location /shared/origin-store
+checkpoint-core remote add origin --type filesystem --path /shared/origin-store
 checkpoint-core push origin main
 checkpoint-core pull origin main
-checkpoint-core bundle export main --out main.tar.gz   # portable, server-free
+checkpoint-core bundle create --out main.tar.gz        # portable, server-free
 ```
 
 Interop with the Git world when you want it (bridge only):
@@ -160,8 +160,10 @@ checkpoint-core git-import ./legacy-repo # import a Git repo; Checkpoint becomes
 | `timeline [<session-id>]` | The full story of a session: start, autosaves, snapshots, verification, accept, rollback. |
 | `recover [--restore [--to <id>] --yes]` | Detect an interrupted session and restore its latest (or a chosen) autosave. |
 | `branch [<name>]` / `checkout <name>` / `merge <name>` | Native branching and line-level (diff3) three-way merge: disjoint edits auto-merge, overlapping edits conflict. |
-| `remote add <name> --location <dir>` / `push` / `pull` | Content-addressed sync between stores (server-free). |
-| `bundle export\|import` | Portable `.tar.gz` transport for offline sync. |
+| `remote add\|list\|show\|remove` | Manage filesystem remotes. |
+| `fetch` / `pull` / `push` / `clone` | Hardened sync: verify before refs move; fetch→tracking refs, FF-only pull, safe push (`--force-with-lease`). |
+| `sync status <remote>` | Ahead/behind/diverged + missing-object counts. |
+| `bundle create\|verify\|import` | Portable `.tar.gz` transport; import verifies path-safety, hashes, seals, signatures, and rejects private keys. |
 | `git-export <dir>` / `git-import <dir>` | The Git bridge (the only Git-touching code). |
 | `verify-history` | Recompute SHA-256 seals across accepted history; flags tampering. |
 | `identity create\|list\|show\|trust\|untrust\|revoke\|import\|export\|current\|use` | Manage Ed25519 signing identities and local trust. |
@@ -282,6 +284,37 @@ checkpoint-core trust-status           # signed vs unsigned history, trusted vs 
 - Vendored pure-Python Ed25519 fallback means signing/verification work even without the
   `cryptography` package — and with Git uninstalled. See §14 of the spec.
 
+## Move between machines without trusting the remote
+
+Phase 6 makes it safe to push, pull, clone, and exchange bundles between machines. The
+rule is simple: **verify everything before any ref moves.**
+
+```bash
+checkpoint-core remote add origin --type filesystem --path ../origin
+checkpoint-core push origin main           # sends only missing objects, atomic ref update
+checkpoint-core clone ../origin team-copy  # verifies the whole graph before refs move
+checkpoint-core fetch origin               # writes refs/remotes/origin/* (not your branch)
+checkpoint-core pull origin main           # fast-forwards after verification (refuses if diverged)
+checkpoint-core sync status origin         # ahead / behind / diverged
+```
+
+- **Never trust the remote.** Received objects are content-verified (`sha256 == id`); the
+  closure's seals, parent chains, tree/blob references, and (optionally) signatures are
+  checked **before** the ref updates. A bad object, a ref to a non-snapshot, a broken
+  parent chain, or a failed seal/signature → the ref does not move.
+- **fetch ≠ merge.** `fetch` writes remote-tracking refs only; `pull` fast-forwards or
+  refuses divergence and tells you to `merge`. `push` is fast-forward-by-default; override
+  with `--force-with-lease`, which only succeeds if the remote is where you think it is.
+- **Atomic refs** (temp → fsync → rename). **`--dry-run`** on fetch/pull/push changes
+  nothing.
+- **Hardened bundles.** `bundle verify`/`import` reject **path traversal**, **absolute
+  paths**, **escaping symlinks**, **private-key material**, **malformed manifests**, and
+  **content-hash mismatches** — extracting to a temp area and verifying before touching
+  your store.
+- **Private keys never transfer** (push/pull/clone/bundle). Public identities + signatures
+  do, so another machine can verify the trust chain; imported identities arrive untrusted.
+  Autosaves don't transfer unless you explicitly enable it. See §15 of the spec.
+
 ## How it works (native objects, no Git)
 
 - **Blob** — raw file bytes, addressed by `sha256(bytes)`.
@@ -345,8 +378,10 @@ It is a bridge for adoption, not the protocol. See
 3. **Phase 3 (done):** native rename detection in diff, merge, history, and packets.
 4. **Phase 4 (done):** object GC + `fsck` — integrity checking and safe garbage collection.
 5. **Phase 5 (done):** signed identity & trust (Ed25519) — provable authorship and approval.
-6. **Phase 6:** remote protocol hardening; hosted Checkpoint service; agent integrations
-   (Cursor, Claude Code, Codex, Copilot); web UI; team policy/compliance.
+6. **Phase 6 (done):** hardened remote sync — fetch/pull/push/clone/bundles, verify before
+   refs move, never trust the remote.
+7. **Next:** policy engine; hosted Checkpoint service API; web review UI; agent integrations
+   (Cursor, Claude Code, Codex, Copilot); public developer preview.
 4. **Phase 4:** hosted Checkpoint service (same object model and sync verbs over HTTP).
 5. **Phase 5:** web UI for sessions, diffs, prompts, verification, approvals, rollback.
 6. **Phase 6:** team workflow, policy engine, compliance, audit, enterprise controls.
