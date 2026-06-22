@@ -298,12 +298,21 @@ def cmd_claude(args) -> int:
     if rc:
         return rc
 
-    # 2) launch Claude Code with the guardrail prompt (configurable; inherits your terminal)
+    # 2) launch Claude Code with the guardrail prompt.
+    #    Default is headless auto-edit; override the whole command with CHECKPOINT_CLAUDE_CMD.
     if not args.no_launch:
-        cmd = _shlex.split(_os.environ.get("CHECKPOINT_CLAUDE_CMD", "claude"))
-        info(util.dim("\nLaunching Claude Code — work the task, then exit Claude to return here.\n"))
+        default_cmd = "claude -p --permission-mode acceptEdits"
+        cmd = _shlex.split(_os.environ.get("CHECKPOINT_CLAUDE_CMD", default_cmd))
+        if args.model and "--model" not in cmd:
+            cmd += ["--model", args.model]
+        child_env = _os.environ.copy()
+        # Prefer the claude.ai login over a stale/empty ANTHROPIC_API_KEY when asked.
+        use_login = args.login or _os.environ.get("CHECKPOINT_CLAUDE_LOGIN", "").lower() in ("1", "true", "yes")
+        if use_login:
+            child_env.pop("ANTHROPIC_API_KEY", None)
+        info(util.dim("\nClaude Code is working on the task…\n"))
         try:
-            _sub.run(cmd + [_claude_prompt(task)])
+            _sub.run(cmd + [_claude_prompt(task)], env=child_env)
         except FileNotFoundError:
             info(util.yellow("'{}' not found on PATH. Make your changes now, then return here "
                              "and press Enter.".format(cmd[0])))
@@ -2483,6 +2492,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--tag", action="append")
     sp.add_argument("--no-tests", action="store_true", help="skip verification after Claude finishes")
     sp.add_argument("--no-launch", action="store_true", help="don't launch Claude (you make changes), just review")
+    sp.add_argument("--login", action="store_true",
+                    help="use the claude.ai login (ignore ANTHROPIC_API_KEY for this run)")
     sp.add_argument("--decision", choices=["accept", "rollback", "diff", "packet", "quit"],
                     help="non-interactive decision (default: ask)")
     sp.set_defaults(func=cmd_claude)

@@ -64,6 +64,24 @@ checkpoint-core push origin main
 Open **http://127.0.0.1:8800/**, paste the token, and open your session to see the timeline,
 diff, policy, and signatures in one place.
 
+## The easiest way to use Checkpoint with Claude Code
+
+One command. Claude does the work in a reviewed, autosaved session; you get one screen and
+one decision:
+
+```bash
+checkpoint-core claude "Fix the bug"
+```
+
+Then press:
+
+```
+a = accept      r = rollback      d = diff      p = packet      q = quit
+```
+
+That's the whole loop — no sessions/snapshots/policy to learn. (If you hit "credit too low,"
+a stray ANTHROPIC_API_KEY is overriding your claude.ai login — add `--login`.)
+
 ## Try every feature in one command
 
 ```bash

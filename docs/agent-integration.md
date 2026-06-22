@@ -27,11 +27,22 @@ shows **one** summary screen:
 ```
 
 Press `a` to accept (signed, sealed history) or `r` to roll back. That's the whole loop.
-Flags: `--model`, `--no-tests`, `--no-launch` (you make the changes), `--tag`, and
-`--decision accept|rollback|quit` for non-interactive use. The launched command is
-configurable via `CHECKPOINT_CLAUDE_CMD` (default `claude`). The guardrail prompt tells the
+Flags: `--model`, `--no-tests`, `--no-launch` (you make the changes), `--tag`, `--login`, and
+`--decision accept|rollback|quit` for non-interactive use. The guardrail prompt tells the
 agent to keep the change scoped and **not** accept/approve/rollback/override — Checkpoint
 handles those.
+
+### How Claude is launched (and auth)
+
+The default command is **`claude -p --permission-mode acceptEdits`** — headless, auto-accepts
+file edits, runs the task, and exits. Override it entirely with `CHECKPOINT_CLAUDE_CMD`, e.g.
+for fuller autonomy: `CHECKPOINT_CLAUDE_CMD="claude -p --permission-mode bypassPermissions"`,
+or to keep it interactive: `CHECKPOINT_CLAUDE_CMD="claude"`.
+
+**Auth gotcha:** if you see *"Credit balance is too low"*, a stray `ANTHROPIC_API_KEY` in
+your environment is overriding your claude.ai (Pro/Max) login. Use the login instead with
+`--login` or `export CHECKPOINT_CLAUDE_LOGIN=1` (the wrapper then drops `ANTHROPIC_API_KEY`
+for the Claude subprocess). If you intend to use an API key, make sure it has credit.
 
 ## The manual contract (for other agents / custom flows)
 
