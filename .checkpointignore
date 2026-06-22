@@ -1,0 +1,11 @@
+# .checkpointignore — paths Checkpoint Core should never capture.
+# (.checkpoint/ and .git/ are always ignored.)
+node_modules/
+.next/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+*.tar.gz
+*.egg-info/
+.venv/
