@@ -487,10 +487,41 @@ def ui_identities(ctx):
         return err
     out = []
     for i in idmod.list_all(repo):
-        out.append({"name": i.get("name") or i.get("identity_id"), "type": i.get("type", "human"),
+        out.append({"id": i.get("identity_id"),
+                    "name": i.get("name") or i.get("identity_id"), "type": i.get("type", "human"),
                     "fingerprint": i.get("fingerprint", ""), "trust_status": _trust_of(i),
                     "created_at": i.get("created_at", ""), "capabilities": i.get("capabilities", [])})
     return 200, out
+
+
+def _ui_identity_op(ctx, op):
+    repo, err, o, n = _repo(ctx)
+    if err:
+        return err
+    iid = ctx.params[2]
+    pol = policymod.load(repo)
+    if pol is not None:
+        d = policymod.evaluate(pol, {"operation": "revoke" if op == "revoke" else "trust",
+                                     "actor_type": "human"})
+        if d["effect"] == "deny":
+            return 403, {"error": "policy denied", "reasons": d.get("reasons", [])}
+    rec = idmod.set_trust(repo, iid, op == "trust") if op in ("trust", "untrust") else idmod.revoke(repo, iid)
+    if not rec:
+        return 404, {"error": "no such identity"}
+    ctx.store.audit(o, n, {"operation": "identity_" + op, "identity": iid})
+    return 200, {"id": iid, "op": op, "trust_status": _trust_of(idmod.load(repo, iid) or {})}
+
+
+def ui_identity_trust(ctx):
+    return _ui_identity_op(ctx, "trust")
+
+
+def ui_identity_untrust(ctx):
+    return _ui_identity_op(ctx, "untrust")
+
+
+def ui_identity_revoke(ctx):
+    return _ui_identity_op(ctx, "revoke")
 
 
 def ui_verify_signatures(ctx):
@@ -543,6 +574,9 @@ ROUTES = [
     ("POST", r"^/ui/repos/([^/]+)/([^/]+)/policy/check$", ui_policy_check, "policy:read"),
     ("GET", r"^/ui/repos/([^/]+)/([^/]+)/branches$", ui_branches, "refs:read"),
     ("GET", r"^/ui/repos/([^/]+)/([^/]+)/identities$", ui_identities, "identity:read"),
+    ("POST", r"^/ui/repos/([^/]+)/([^/]+)/identities/([^/]+)/trust$", ui_identity_trust, "identity:write"),
+    ("POST", r"^/ui/repos/([^/]+)/([^/]+)/identities/([^/]+)/untrust$", ui_identity_untrust, "identity:write"),
+    ("POST", r"^/ui/repos/([^/]+)/([^/]+)/identities/([^/]+)/revoke$", ui_identity_revoke, "identity:write"),
     ("POST", r"^/ui/repos/([^/]+)/([^/]+)/signatures/verify$", ui_verify_signatures, "repo:read"),
     ("GET", r"^/ui/repos/([^/]+)/([^/]+)/audit$", ui_audit, "repo:read"),
 ]

@@ -242,6 +242,22 @@ def test_ui_session_policy_reflects_verification_and_signature(server, tmp_path)
     assert dec["effect"] == "allow"            # signed + verified + trusted -> allow
 
 
+def test_ui_identity_trust_untrust_revoke(server, tmp_path):
+    """The Identities table's Trust/Revoke buttons map to /ui write endpoints; identities
+    expose an `id` so the UI can address them. (Regression for cosmetic-buttons bug.)"""
+    populate(server, tmp_path)
+    ids = ui(server, base(server) + "/identities")[1]
+    assert ids and ids[0].get("id"), "identity must expose an id for the UI to act on"
+    iid = ids[0]["id"]
+    b = base(server)
+    # imported identities start untrusted
+    assert ui(server, b + "/identities/" + iid + "/trust", "POST")[1]["trust_status"] == "trusted"
+    assert ui(server, b + "/identities/" + iid + "/untrust", "POST")[1]["trust_status"] == "untrusted"
+    assert ui(server, b + "/identities/" + iid + "/revoke", "POST")[1]["trust_status"] == "revoked"
+    # unknown identity -> 404
+    assert ui(server, b + "/identities/nope/trust", "POST")[0] == 404
+
+
 def test_ui_requires_auth(server):
     st, _ = http("GET", server["url"] + "/ui/repos")   # no token
     assert st == 401

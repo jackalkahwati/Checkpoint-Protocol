@@ -194,6 +194,13 @@ export const api = {
   listIdentities: (owner: string, repo: string) =>
     request<Identity[]>(`/repos/${owner}/${repo}/identities`, mockIdentities),
 
+  setIdentityTrust: (owner: string, repo: string, id: string, op: "trust" | "untrust" | "revoke") =>
+    request<{ id: string; op: string; trust_status?: string }>(
+      `/repos/${owner}/${repo}/identities/${id}/${op}`,
+      { id, op },
+      { method: "POST" },
+    ),
+
   runFsck: (owner: string, repo: string) =>
     request<Integrity>(`/repos/${owner}/${repo}/fsck`, mockIntegrity, { method: "POST" }),
 

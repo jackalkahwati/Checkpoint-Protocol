@@ -134,6 +134,7 @@ export interface Integrity {
 }
 
 export interface Identity {
+  id?: string
   name: string
   type: ActorType
   fingerprint: string

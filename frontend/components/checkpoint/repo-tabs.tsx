@@ -1,5 +1,6 @@
 "use client"
 
+import { useState } from "react"
 import { GitBranch, Play, RotateCcw } from "lucide-react"
 
 import { api } from "@/lib/checkpoint/api-client"
@@ -136,62 +137,111 @@ export function PolicyTab({ owner, repo }: { owner: string; repo: string }) {
 }
 
 export function IdentitiesTab({ owner, repo }: { owner: string; repo: string }) {
-  const { data, loading, isMock } = useApi(() => api.listIdentities(owner, repo), [owner, repo])
+  const { data, loading, isMock, reload } = useApi(() => api.listIdentities(owner, repo), [owner, repo])
+  const [pending, setPending] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+
+  async function act(id: string | undefined, op: "trust" | "untrust" | "revoke") {
+    if (!id) return
+    setErr(null)
+    setPending(`${id}:${op}`)
+    try {
+      await api.setIdentityTrust(owner, repo, id, op)
+      reload()
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Action failed.")
+    } finally {
+      setPending(null)
+    }
+  }
+
   if (loading) return <LoadingState />
   return (
-    <div className="overflow-hidden rounded-lg border border-border">
-      <Table>
-        <TableHeader>
-          <TableRow className="bg-secondary/40 hover:bg-secondary/40">
-            <TableHead>Name</TableHead>
-            <TableHead>Type</TableHead>
-            <TableHead>Fingerprint</TableHead>
-            <TableHead>Trust</TableHead>
-            <TableHead>Capabilities</TableHead>
-            <TableHead className="text-right">Actions</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {(data ?? []).map((id) => (
-            <TableRow key={id.fingerprint}>
-              <TableCell className="font-medium text-foreground">{id.name}</TableCell>
-              <TableCell className="capitalize text-muted-foreground">{id.type}</TableCell>
-              <TableCell>
-                <Hash value={id.fingerprint} len={14} />
-              </TableCell>
-              <TableCell>
-                <TrustBadge trust={id.trust_status} />
-              </TableCell>
-              <TableCell>
-                <div className="flex flex-wrap gap-1">
-                  {id.capabilities.length === 0 ? (
-                    <span className="text-xs text-muted-foreground">—</span>
-                  ) : (
-                    id.capabilities.map((cap) => (
-                      <span
-                        key={cap}
-                        className="rounded border border-border bg-muted px-1.5 py-px font-mono text-[10px] text-muted-foreground"
-                      >
-                        {cap}
-                      </span>
-                    ))
-                  )}
-                </div>
-              </TableCell>
-              <TableCell className="text-right">
-                <div className="flex justify-end gap-1">
-                  <Button variant="outline" size="sm" disabled={isMock}>
-                    Trust
-                  </Button>
-                  <Button variant="ghost" size="sm" disabled={isMock}>
-                    Revoke
-                  </Button>
-                </div>
-              </TableCell>
+    <div className="flex flex-col gap-2">
+      {err ? <p className="text-sm text-destructive">{err}</p> : null}
+      {isMock ? (
+        <p className="text-xs text-muted-foreground">Mock data — trust actions are disabled.</p>
+      ) : null}
+      <div className="overflow-hidden rounded-lg border border-border">
+        <Table>
+          <TableHeader>
+            <TableRow className="bg-secondary/40 hover:bg-secondary/40">
+              <TableHead>Name</TableHead>
+              <TableHead>Type</TableHead>
+              <TableHead>Fingerprint</TableHead>
+              <TableHead>Trust</TableHead>
+              <TableHead>Capabilities</TableHead>
+              <TableHead className="text-right">Actions</TableHead>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {(data ?? []).map((id) => {
+              const revoked = id.trust_status === "revoked"
+              const trusted = id.trust_status === "trusted"
+              const busy = pending?.startsWith(`${id.id}:`)
+              return (
+                <TableRow key={id.fingerprint}>
+                  <TableCell className="font-medium text-foreground">{id.name}</TableCell>
+                  <TableCell className="capitalize text-muted-foreground">{id.type}</TableCell>
+                  <TableCell>
+                    <Hash value={id.fingerprint} len={14} />
+                  </TableCell>
+                  <TableCell>
+                    <TrustBadge trust={id.trust_status} />
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap gap-1">
+                      {id.capabilities.length === 0 ? (
+                        <span className="text-xs text-muted-foreground">—</span>
+                      ) : (
+                        id.capabilities.map((cap) => (
+                          <span
+                            key={cap}
+                            className="rounded border border-border bg-muted px-1.5 py-px font-mono text-[10px] text-muted-foreground"
+                          >
+                            {cap}
+                          </span>
+                        ))
+                      )}
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <div className="flex justify-end gap-1">
+                      {trusted ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={isMock || busy || !id.id}
+                          onClick={() => act(id.id, "untrust")}
+                        >
+                          Untrust
+                        </Button>
+                      ) : (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={isMock || busy || revoked || !id.id}
+                          onClick={() => act(id.id, "trust")}
+                        >
+                          Trust
+                        </Button>
+                      )}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={isMock || busy || revoked || !id.id}
+                        onClick={() => act(id.id, "revoke")}
+                      >
+                        Revoke
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              )
+            })}
+          </TableBody>
+        </Table>
+      </div>
     </div>
   )
 }
