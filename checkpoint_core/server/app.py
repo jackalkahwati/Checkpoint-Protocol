@@ -63,6 +63,30 @@ def _repo_or_404(ctx) -> Tuple[Optional[Repo], Optional[Tuple[int, Any]]]:
     return repo, None
 
 
+from pathlib import Path as _Path
+_WEB_DIR = _Path(__file__).parent / "web"
+_STATIC = {
+    "app.js": "application/javascript; charset=utf-8",
+    "style.css": "text/css; charset=utf-8",
+}
+
+
+def h_index(ctx):
+    f = _WEB_DIR / "index.html"
+    if not f.exists():
+        return 200, {"error": "web UI not built"}
+    return 200, ("bytes", "text/html; charset=utf-8", f.read_bytes())
+
+
+def h_static(ctx):
+    name = ctx.params[0]
+    ctype = _STATIC.get(name)
+    f = _WEB_DIR / name
+    if ctype is None or not f.exists():
+        return 404, {"error": "not found"}
+    return 200, ("bytes", ctype, f.read_bytes())
+
+
 def h_health(ctx):
     return 200, {"status": "ok"}
 
@@ -468,7 +492,12 @@ def h_diff(ctx):
             return None
         kind, obj = reachablemod.classify(repo, ref)
         return obj["tree"] if kind == "snapshot" else ref
-    return 200, diff_result(repo, tree_of(body.get("from")), tree_of(body.get("to")))
+    a, b = tree_of(body.get("from")), tree_of(body.get("to"))
+    result = diff_result(repo, a, b)
+    if body.get("unified"):
+        from ..diff import unified_result
+        result["unified"] = unified_result(repo, a, b)
+    return 200, result
 
 
 def h_merge_preview(ctx):
@@ -643,6 +672,8 @@ def _record_server_policy(repo, decision):
 
 # (method, regex, handler, required_scope)
 ROUTES: List[Tuple[str, Any, Callable, Optional[str]]] = [
+    ("GET", r"^/$", h_index, None),
+    ("GET", r"^/(app\.js|style\.css)$", h_static, None),
     ("GET", r"^/health$", h_health, None),
     ("GET", r"^/version$", h_version, None),
     ("GET", r"^/capabilities$", h_capabilities, None),

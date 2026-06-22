@@ -22,6 +22,9 @@ checkpoint = "checkpoint.cli:main"
 [tool.setuptools]
 packages = ["checkpoint_core", "checkpoint_core.server", "checkpoint"]
 
+[tool.setuptools.package-data]
+"checkpoint_core.server" = ["web/*.html", "web/*.css", "web/*.js"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

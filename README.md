@@ -373,6 +373,27 @@ checkpoint-core clone http://localhost:8800/acme/app ./local --token <TOKEN>
 - Built on the standard library; **works with Git uninstalled.** Full reference:
   [`docs/checkpoint-hosted-api.md`](docs/checkpoint-hosted-api.md).
 
+## Review work sessions in the browser (web UI)
+
+GitHub reviews commits. **Checkpoint reviews work sessions.** The web UI shows what GitHub
+can't: session → prompt → autosaves → snapshots → verification → policy → signatures →
+accept. It's a **no-build vanilla-JS app served by `checkpoint-server`** (zero toolchain,
+consistent with the project's zero-dependency ethos).
+
+```bash
+checkpoint-server start --port 8800
+open http://127.0.0.1:8800/        # paste an API token to log in
+```
+
+The **session review page** puts the whole work episode on one screen — instruction,
+agent/model/tool, timeline, rename-aware diff, packet, policy decision (allow/deny + reasons
++ required actions), signatures & trust (signer identity/type, trusted/untrusted/unknown/
+revoked), verification, and live integrity — with Policy-check / Verify-signatures / fsck
+actions. Accept/reject/rollback are shown as the exact CLI commands (they run client-side).
+401 returns to login; 403 shows a clear permission error; private keys are never displayed.
+Full reference: [`docs/checkpoint-web-ui.md`](docs/checkpoint-web-ui.md); walkthrough:
+[`examples/web_review_demo.md`](examples/web_review_demo.md).
+
 ## How it works (native objects, no Git)
 
 - **Blob** — raw file bytes, addressed by `sha256(bytes)`.
@@ -442,8 +463,10 @@ It is a bridge for adoption, not the protocol. See
    reasoned overrides.
 8. **Phase 8 (done):** hosted service API — host repos over HTTP with token auth, verified
    transfer, server-side policy, and audit; the protocol foundation for hosted Checkpoint.
-9. **Next:** web review UI; agent integrations (Cursor, Claude Code, Codex, Copilot);
-   public developer preview.
+9. **Phase 9 (done):** web review UI — review work sessions (prompt → diff → policy →
+   signatures → accept) in the browser, served by the API.
+10. **Next:** agent integrations (Cursor, Claude Code, Codex, Copilot); public developer
+    preview (v1.0).
 4. **Phase 4:** hosted Checkpoint service (same object model and sync verbs over HTTP).
 5. **Phase 5:** web UI for sessions, diffs, prompts, verification, approvals, rollback.
 6. **Phase 6:** team workflow, policy engine, compliance, audit, enterprise controls.

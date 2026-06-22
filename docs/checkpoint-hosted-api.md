@@ -75,9 +75,15 @@ rejected (403) on any other repo.
   hashes, seals, signatures, **reject private keys**) then import
 - `GET …/bundles/export?branch=` → `.tar.gz` *(repo:read)*
 
+### Web UI (no auth — the SPA shell)
+- `GET /` → the review UI (single-page app); `GET /app.js`, `GET /style.css`.
+  See [`checkpoint-web-ui.md`](checkpoint-web-ui.md). All data calls use the authenticated
+  API below.
+
 ### Sessions / diffs
 - `GET …/sessions`, `GET …/sessions/{id}`, `…/{id}/timeline`, `…/{id}/packet`
-- `POST …/diff` `{from, to}` → rename-aware DiffResult
+- `POST …/diff` `{from, to, unified?}` → rename-aware DiffResult; with `unified: true` the
+  response also includes a colorizable unified-diff `unified` string
 - `POST …/merge-preview` `{ours, theirs}` → `{clean, conflicts, auto_merged, rename_records}`
   (does **not** mutate refs)
 
