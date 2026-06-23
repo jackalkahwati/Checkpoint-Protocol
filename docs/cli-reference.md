@@ -35,6 +35,14 @@ Run any command with `--help` for full flags. Three entry points:
 `sign <snapshot>` · `verify-signatures` · `trust-status` ·
 `policy init\|show\|check\|explain\|validate\|test\|audit`
 
+### Merge requests (scriptable review — talks to the hosted remote)
+`mr create --title "…" --from <branch> [--to main] [--snapshot|--session]` ·
+`mr list` · `mr show <id>` · `mr status <id>` · `mr diff <id>` ·
+`mr comment <id> [--file --line] --body "…"` · `mr approve <id>` · `mr unapprove <id>` ·
+`mr merge <id>` · `mr close <id>` ·
+`mr review <id> [--decision approve|merge|diff|comment|quit]` (one-screen terminal review).
+Uses the `checkpoint`/`origin` http remote (or `--remote <name>`).
+
 ### Remotes / sync
 `remote add\|list\|show\|remove` (filesystem or `http://host/owner/repo --token`) ·
 `fetch` · `pull` · `push [--force-with-lease]` · `clone <src> <dest> [--token]` ·

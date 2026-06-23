@@ -369,6 +369,259 @@ def _claude_review(repo: Repo, args) -> int:
             return rc
 
 
+# ---------------------------------------------------------------------- mr (scriptable review surface)
+
+def _mr_remote(args):
+    """Resolve the hosted remote backing merge requests -> (ui_base, token, owner, repo).
+
+    ui_base is the server's /ui adapter root for this repo, e.g.
+    http://host:8800/ui/repos/<owner>/<repo>.
+    """
+    from urllib.parse import urlparse
+    repo = _repo()
+    remotes = remotemod.list_remotes(repo)
+    name = getattr(args, "remote", None)
+    spec = None
+    if name:
+        spec = remotes.get(name)
+    else:
+        for cand in ("checkpoint", "origin"):
+            if remotes.get(cand, {}).get("type") == "http":
+                spec = remotes[cand]; break
+        if spec is None:
+            https = [s for s in remotes.values() if s.get("type") == "http"]
+            spec = https[0] if len(https) == 1 else None
+    if not spec or spec.get("type") != "http":
+        err("no hosted remote configured. Add one: checkpoint-core remote add checkpoint "
+            "http://host:8800/<owner>/<repo> --token <TOKEN>")
+        return None
+    u = urlparse(spec["url"].rstrip("/"))
+    parts = [p for p in u.path.split("/") if p]
+    if len(parts) < 2:
+        err("remote URL must be http://host/<owner>/<repo>")
+        return None
+    owner, name_ = parts[-2], parts[-1]
+    ui_base = "{}://{}/ui/repos/{}/{}".format(u.scheme, u.netloc, owner, name_)
+    return ui_base, spec.get("token"), owner, name_
+
+
+def _mr_call(method, ui_base, token, path, body=None):
+    return remotemod._http(method, ui_base + path, token, body)
+
+
+def _mr_diff_text(diff) -> None:
+    for f in diff or []:
+        ct = f.get("change_type")
+        if ct == "renamed":
+            info(util.bold("R {} -> {}".format(f["old_path"], f["new_path"]))
+                 + util.dim("  {}%".format(f.get("similarity", "?"))))
+        else:
+            p = f.get("new_path") if ct != "deleted" else f.get("old_path")
+            info(util.bold("{} {}".format(ct[:1].upper(), p)))
+        for h in f.get("hunks", []):
+            info(util.cyan("  " + h.get("header", "")))
+            for ln in h.get("lines", []):
+                k = ln.get("kind"); t = ln.get("text", "")
+                if k == "add":
+                    info(util.green("  +" + t))
+                elif k == "del":
+                    info(util.red("  -" + t))
+                else:
+                    info(util.dim("   " + t))
+
+
+def _mr_print_screen(d) -> None:
+    """The one-screen review summary (mirrors checkpoint-core claude)."""
+    st = {"open": util.cyan, "merged": util.green, "closed": util.dim}.get(d["status"], str)
+    info("")
+    info(util.bold("MR {}: {}".format(d["id"], d["title"])) + "   " + st(d["status"]))
+    info("  Source:    {}".format(_short(d.get("source_snapshot") or "")
+                                   + (" (session {})".format(d["source_session"][:18]) if d.get("source_session") else "")))
+    info("  Target:    {}".format(d.get("target_branch")))
+    nfiles = len(d.get("diff", []))
+    ins = sum(f.get("additions", 0) for f in d.get("diff", []))
+    dels = sum(f.get("deletions", 0) for f in d.get("diff", []))
+    info("  Files:     {} (+{} -{})".format(nfiles, ins, dels))
+    m = d.get("mergeability", {})
+    sig = d.get("signatures", [])
+    sigok = "valid" if sig and all(s.get("status") == "valid" for s in sig) else ("unsigned" if not sig else "invalid")
+    pol = d.get("policy")
+    info("  Policy:    {}".format(_mr_color_effect(pol)))
+    info("  Approvals: {}{}".format(d.get("approval_count", 0),
+                                    "  ({})".format(", ".join(d.get("approvals", []))) if d.get("approvals") else ""))
+    info("  Comments:  {} unresolved".format(d.get("unresolved_count", 0)))
+    info("  Conflicts: {}".format(util.green("none") if m.get("clean") else
+                                  util.red(", ".join(m.get("conflicts", [])) or "yes")))
+    info("  Signatures:{}".format(" " + (util.green("valid") if sigok == "valid" else util.yellow(sigok))))
+    info("")
+    info("  [a] approve   [m] merge   [d] diff   [c] comment   [q] quit")
+
+
+def _mr_color_effect(pol):
+    if pol is None:
+        return "allowed (no policy)"
+    if pol["effect"] == "allow":
+        return util.green("allowed")
+    if pol["effect"] == "deny":
+        return util.red("DENIED — " + "; ".join(pol.get("reasons", [])))
+    return util.yellow("warn — " + "; ".join(pol.get("reasons", [])))
+
+
+def _mr_merge_report(res) -> int:
+    s = res.get("status")
+    if s == "merged":
+        info(util.green("Merged ") + "into target" + (" -> " + _short(res["snapshot"]) if res.get("snapshot") else ""))
+        return 0
+    if s == "conflicts":
+        err("merge conflicts: " + ", ".join(res.get("conflicts", [])))
+        info(util.dim("  resolve locally (checkpoint-core merge) and push, then retry"))
+        return 1
+    if s == "policy-denied":
+        err("policy denied: " + "; ".join(res.get("reasons", [])))
+        for a in res.get("required_actions", []):
+            info(util.dim("  - " + a))
+        return 1
+    err("merge failed: " + (res.get("error") or s or "unknown"))
+    return 1
+
+
+def cmd_mr(args) -> int:
+    sub = args.mr_cmd
+    if not sub:
+        err("usage: checkpoint-core mr <create|list|show|diff|comment|approve|unapprove|merge|close|status|review>")
+        return 2
+    r = _mr_remote(args)
+    if r is None:
+        return 2
+    ui_base, token, owner, name = r
+    base = "/reviews"
+
+    if sub == "create":
+        body = {"title": args.title or "(untitled)", "target_branch": args.to or "main"}
+        if args.from_branch:
+            body["source_branch"] = args.from_branch
+        elif args.snapshot:
+            body["source_snapshot"] = args.snapshot
+        elif args.session:
+            body["source_session"] = args.session
+        else:
+            err("provide a source: --from <branch>, --snapshot <id>, or --session <id>")
+            return 2
+        st, resp = _mr_call("POST", ui_base, token, base, body)
+        if st not in (200, 201):
+            err("create failed ({}): {}".format(st, resp.get("error") if isinstance(resp, dict) else resp))
+            return 1
+        info(util.green("Created ") + util.bold(resp["id"]) + " — " + resp["title"]
+             + util.dim("  ({} -> {})".format(_short(resp.get("source_snapshot") or ""), resp["target_branch"])))
+        return 0
+
+    if sub == "list":
+        st, rows = _mr_call("GET", ui_base, token, base)
+        if st != 200:
+            err("list failed ({})".format(st)); return 1
+        if not rows:
+            info("No merge requests."); return 0
+        info(util.bold("{:<7} {:<8} {:<10} {:<8} {}".format("ID", "STATUS", "INTO", "APPROVE", "TITLE")))
+        for m in rows:
+            info("{:<7} {:<8} {:<10} {:<8} {}".format(
+                m["id"], m["status"], m.get("target_branch", "")[:10],
+                "{}".format(m.get("approval_count", 0)), m["title"][:50]))
+        return 0
+
+    if sub in ("show", "status", "diff", "review"):
+        st, d = _mr_call("GET", ui_base, token, base + "/" + args.id)
+        if st != 200:
+            err("no such merge request: {}".format(args.id)); return 1
+        if sub == "diff":
+            _mr_diff_text(d.get("diff", []))
+            return 0
+        if sub == "status":
+            info("{} [{}] into {} · approvals {} · {} · conflicts {}".format(
+                d["id"], d["status"], d.get("target_branch"), d.get("approval_count", 0),
+                "policy " + (d["policy"]["effect"] if d.get("policy") else "none"),
+                "none" if d.get("mergeability", {}).get("clean") else "yes"))
+            return 0
+        if sub == "show":
+            _mr_print_screen(d)
+            return 0
+        # review (interactive)
+        return _mr_review_loop(ui_base, token, base, args, d)
+
+    if sub == "comment":
+        body = {"body": args.body, "path": args.file, "line": args.line}
+        st, c = _mr_call("POST", ui_base, token, base + "/" + args.id + "/comments", body)
+        if st not in (200, 201):
+            err("comment failed ({})".format(st)); return 1
+        info(util.green("Commented ") + ("on {}:{}".format(args.file, args.line) if args.file else "(general)"))
+        return 0
+
+    if sub in ("approve", "unapprove"):
+        st, m = _mr_call("POST", ui_base, token, base + "/" + args.id + "/approve",
+                         {"approve": sub == "approve"})
+        if st != 200:
+            err("{} failed ({})".format(sub, st)); return 1
+        info(util.green("{}d ".format(sub.capitalize())) + args.id
+             + util.dim("  ({} approval(s))".format(m.get("approval_count", 0))))
+        return 0
+
+    if sub == "merge":
+        st, res = _mr_call("POST", ui_base, token, base + "/" + args.id + "/merge", {})
+        return _mr_merge_report(res if isinstance(res, dict) else {"status": "error"})
+
+    if sub == "close":
+        st, m = _mr_call("POST", ui_base, token, base + "/" + args.id + "/close", {})
+        if st != 200:
+            err("close failed ({})".format(st)); return 1
+        info(util.green("Closed ") + args.id)
+        return 0
+
+    err("unknown mr subcommand: {}".format(sub))
+    return 2
+
+
+def _mr_review_loop(ui_base, token, base, args, d) -> int:
+    _mr_print_screen(d)
+
+    def act(choice):
+        if choice in ("a", "approve"):
+            _mr_call("POST", ui_base, token, base + "/" + args.id + "/approve", {"approve": True})
+            info(util.green("Approved.")); return None
+        if choice in ("m", "merge"):
+            st, res = _mr_call("POST", ui_base, token, base + "/" + args.id + "/merge", {})
+            return _mr_merge_report(res if isinstance(res, dict) else {"status": "error"})
+        if choice in ("d", "diff"):
+            _mr_diff_text(d.get("diff", [])); return None
+        if choice in ("c", "comment"):
+            try:
+                body = input("comment: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if body:
+                _mr_call("POST", ui_base, token, base + "/" + args.id + "/comments", {"body": body})
+                info(util.green("Commented."))
+            return None
+        if choice in ("q", "quit"):
+            return 0
+        return None
+
+    if args.decision:
+        rc = act(args.decision)
+        return rc if rc is not None else 0
+    while True:
+        try:
+            choice = input("\n> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return 0
+        rc = act(choice)
+        if rc is not None:
+            return rc
+        # refresh after an action that changed state
+        st, d2 = _mr_call("GET", ui_base, token, base + "/" + args.id)
+        if st == 200:
+            d = d2
+            _mr_print_screen(d)
+
+
 # ---------------------------------------------------------------------- identity
 
 def _fp_short(rec) -> str:
@@ -2497,6 +2750,47 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--decision", choices=["accept", "rollback", "diff", "packet", "quit"],
                     help="non-interactive decision (default: ask)")
     sp.set_defaults(func=cmd_claude)
+
+    # ---- mr: scriptable merge-request review surface (talks to the hosted remote) ----
+    mp = sub.add_parser("mr", help="merge requests: create/list/show/diff/comment/approve/merge/...")
+    msub = mp.add_subparsers(dest="mr_cmd")
+
+    def _mr_add(name, helptext, with_id=True):
+        s = msub.add_parser(name, help=helptext)
+        if with_id:
+            s.add_argument("id")
+        s.add_argument("--remote", help="remote name (default: checkpoint/origin)")
+        return s
+
+    c = msub.add_parser("create", help="open a merge request")
+    c.add_argument("--title", required=True)
+    c.add_argument("--from", dest="from_branch", help="source branch")
+    c.add_argument("--snapshot", help="source accepted-snapshot id")
+    c.add_argument("--session", help="source session id (uses its accepted snapshot)")
+    c.add_argument("--to", default="main", help="target branch (default: main)")
+    c.add_argument("--remote")
+
+    lst = msub.add_parser("list", help="list merge requests")
+    lst.add_argument("--remote")
+
+    _mr_add("show", "one-screen MR summary")
+    _mr_add("status", "compact one-line status")
+    _mr_add("diff", "print the MR diff")
+    _mr_add("approve", "approve the MR")
+    _mr_add("unapprove", "remove your approval")
+    _mr_add("merge", "merge the MR (server-signed, conflict-aware)")
+    _mr_add("close", "close the MR without merging")
+
+    cm = _mr_add("comment", "comment on the MR (optionally inline)")
+    cm.add_argument("--file", help="anchor the comment to a file path")
+    cm.add_argument("--line", type=int, help="anchor to a line number")
+    cm.add_argument("--body", required=True)
+
+    rv = _mr_add("review", "interactive review screen ([a]approve [m]merge [d]diff [c]comment [q]quit)")
+    rv.add_argument("--decision", choices=["approve", "merge", "diff", "comment", "quit"],
+                    help="non-interactive action (default: ask)")
+
+    mp.set_defaults(func=cmd_mr, mr_cmd=None)
 
     sp = sub.add_parser("setup",
                         help="one-shot: init + identity + ignore + remote + server repo + policy")

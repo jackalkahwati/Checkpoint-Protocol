@@ -607,12 +607,18 @@ def ui_reviews_create(ctx):
     target = b.get("target_branch") or "main"
     source_snapshot = b.get("source_snapshot")
     source_session = b.get("source_session")
+    source_branch = b.get("source_branch")
     # resolve a session to its accepted snapshot
     if not source_snapshot and source_session:
         sess = _load_session(repo, source_session)
         source_snapshot = (sess.get("result") or {}).get("snapshot") if sess else None
+    # resolve a branch to its head snapshot
+    if not source_snapshot and source_branch:
+        source_snapshot = repo.read_ref("refs/heads/{}".format(source_branch))
+        if not source_snapshot:
+            return 404, {"error": "no such source branch: {}".format(source_branch)}
     if not source_snapshot:
-        return 400, {"error": "source_snapshot or an accepted source_session is required"}
+        return 400, {"error": "source_snapshot, source_branch, or an accepted source_session is required"}
     if not repo.has_object(source_snapshot):
         return 404, {"error": "source snapshot not found"}
     rec = reviewsmod.create_review(

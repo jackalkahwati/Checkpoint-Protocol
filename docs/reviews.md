@@ -44,10 +44,25 @@ POST /ui/repos/{o}/{r}/reviews/{id}/merge           -> merged | conflicts(409) |
 POST /ui/repos/{o}/{r}/reviews/{id}/close
 ```
 
+## CLI (scriptable — for agents and terminals)
+
+The whole loop is available from the CLI (talks to your `checkpoint`/`origin` http remote):
+
+```bash
+checkpoint-core mr create --title "Fix sync" --from agent/fix-sync --to main
+checkpoint-core mr list
+checkpoint-core mr review mr_1        # one-screen: source/target, files, policy, approvals, conflicts, signatures
+                                      # [a] approve  [m] merge  [d] diff  [c] comment  [q] quit
+checkpoint-core mr approve mr_1
+checkpoint-core mr comment mr_1 --file app.py --line 12 --body "rename this"
+checkpoint-core mr merge mr_1         # server-signed, conflict-aware, atomic
+```
+
+For agents/automation, every step has a non-interactive command (and `mr review --decision
+merge`), so the Owner Agent / policy pipeline can drive review and merge without the web UI.
+
 ## Limits (preview)
 
 - Comments anchor to a file/line; merge is **line-level** (diff3), not semantic.
-- A native `checkpoint-core mr …` CLI is on the roadmap (v1.1); today MRs are driven from the
-  web UI / the `/ui` API.
 - The server is single-process (per-repo locks make concurrent merges safe; not horizontally
   scaled). See [`../ROADMAP.md`](../ROADMAP.md).
