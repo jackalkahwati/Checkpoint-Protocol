@@ -927,6 +927,8 @@ def _next_emit(d, as_json) -> int:
     info("  Signatures:    {}".format(d["signatures"]))
     info("  Backup:        {}".format(d["backup"]["status"]))
     info("  Integrity:     {}".format(d["integrity"]))
+    if d["backup"].get("status") == "not reachable":
+        info("  " + util.yellow("Backup remote is unreachable — fix it or continue local-only (not broken)."))
     info("")
     if d.get("active_session"):
         a = d["active_session"]

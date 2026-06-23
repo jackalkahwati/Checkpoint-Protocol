@@ -129,6 +129,43 @@ def test_first_push_no_private_keys_or_autosaves(repo, tmp_path):
 
 # ---------------------------------------------------------------- web + continue
 
+def test_next_backup_unreachable_is_not_broken(repo, capsys, tmp_path):
+    _init_base(repo)
+    bk = tmp_path / "bk"
+    run(["first-push", "--yes", "--dest", str(bk)])
+    import shutil
+    shutil.rmtree(bk)                                  # backup destination vanished
+    d = nextj(capsys)
+    assert d["backup"]["status"] == "not reachable"
+    assert d["recommended_action"] != "backup"         # can't recommend an unreachable backup
+    assert d["integrity"] == "healthy"                 # repo itself is fine, not "broken"
+
+
+def test_claude_login_drops_api_key(repo, tmp_path, monkeypatch):
+    _init_base(repo)
+    out = tmp_path / "key.txt"
+    fc = tmp_path / "cc.sh"
+    fc.write_text('#!/bin/bash\nprintf "[%s]" "${{ANTHROPIC_API_KEY}}" > "{}"\n'.format(out)); fc.chmod(0o755)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-no-credit")
+    monkeypatch.setenv("CHECKPOINT_CLAUDE_CMD", str(fc))
+    (repo / "x.py").write_text("a\n")
+    run(["claude", "do x", "--login", "--no-tests", "--decision", "quit"])
+    assert out.read_text() == "[]"                       # --login dropped the stale key
+    run(["rollback", "--hard", "--yes"])
+
+
+def test_claude_cmd_override_passthrough(repo, tmp_path, monkeypatch):
+    _init_base(repo)
+    out = tmp_path / "argv.txt"
+    fc = tmp_path / "cc.sh"
+    fc.write_text('#!/bin/bash\nprintf "%s" "$1" > "{}"\n'.format(out)); fc.chmod(0o755)
+    monkeypatch.setenv("CHECKPOINT_CLAUDE_CMD", "{} -p --dangerously-skip-permissions".format(fc))
+    (repo / "x.py").write_text("a\n")
+    run(["claude", "do y", "--no-tests", "--decision", "quit"])
+    assert out.read_text() == "-p"                       # configured flags pass through before the prompt
+    run(["rollback", "--hard", "--yes"])
+
+
 def test_web_prints_url(repo, capsys):
     run(["web"])
     out = capsys.readouterr().out
