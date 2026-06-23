@@ -2,6 +2,26 @@
 
 All notable changes to Checkpoint. Versions are tagged in Git.
 
+## v1.2 — Personal Autopilot (AI-owned loop)
+- `checkpoint-core claude "<task>" --autopilot` (and `autopilot claude`): Builder writes →
+  **Owner Agent** reviews → auto-accept low-risk work or **escalate** with a clear reason →
+  fsck + verify-signatures + backup + push after acceptance → one final screen. `--decision
+  auto|escalate|rollback-on-fail`, `--json`.
+- **Owner Agent** (`owneragent.py`): deterministic, policy-bounded reviewer; separate identity
+  from the Builder (no self-approval); never overrides/loosens policy; never trusts identities;
+  reviews are ledgered + signed. Conservative default: only docs/tests/examples/markdown
+  auto-accept.
+- `checkpoint-core personal init|status|daily` and `backup init|run|status|restore`
+  (filesystem backup; never transfers private keys; verified; preview-before-restore).
+- Policy engine: `min_approvals` now enforced on merge too.
+- Docs: personal-autopilot, owner-agent, backup, daily-workflow.
+- Deferred (honest): web dashboard panels for Owner Agent reviews; semantic merge;
+  multi-process/TLS; hosted accounts.
+
+## v1.1 — Merge-request CLI
+- `checkpoint-core mr create|list|show|diff|comment|approve|unapprove|merge|close|status|review`
+  — scriptable, agent-usable review surface over the hosted `/ui` API; `mr review` one-screen.
+
 ## v1.0-preview — Public Developer Preview (review loop)
 - **Merge requests**: open from a reviewed session → diff + mergeability → review thread →
   approvals → server-signed, conflict-aware, atomic merge. Inline per-line diff comments;

@@ -13,6 +13,7 @@ from typing import List, Optional
 
 from . import __version__, objects, util
 from . import autosave as autosavemod, autowatch as autowatchmod, engine, ledger as ledgermod
+from . import owneragent as owneragentmod
 from . import fsck as fsckmod, gc as gcmod, reachable as reachablemod
 from . import identity as idmod, merge as mergemod, policy as policymod
 from . import remote as remotemod, secrets as secretscan, sign as signmod
@@ -326,8 +327,141 @@ def cmd_claude(args) -> int:
         cmd_verify(argparse.Namespace())
     cmd_packet(argparse.Namespace(json=False))
 
-    # 4) one summary screen + decision
+    # 4) review + decision — autopilot (Owner Agent) or manual
+    if getattr(args, "autopilot", False):
+        return _autopilot_review(repo, args)
     return _claude_review(repo, args)
+
+
+# ---- autopilot: Owner Agent reviews, then auto-accepts low-risk work or escalates ----
+
+def _push_default_if_configured(repo) -> str:
+    for n in ("checkpoint", "origin"):
+        spec = remotemod.list_remotes(repo).get(n)
+        if spec and spec.get("type") == "http":
+            try:
+                res = remotemod.push(repo, n, repo.head_branch() or "main")
+                return "pushed" if res.get("status") == "pushed" else res.get("status", "?")
+            except Exception as exc:
+                return "failed: {}".format(exc)
+    return "not configured"
+
+
+def _backup_run_if_configured(repo) -> str:
+    spec = remotemod.list_remotes(repo).get("backup")
+    if not spec:
+        return "not configured"
+    try:
+        res = remotemod.push(repo, "backup", repo.head_branch() or "main")
+        return "synced" if res.get("status") in ("pushed", "up-to-date") else res.get("status", "?")
+    except Exception as exc:
+        return "failed: {}".format(exc)
+
+
+def _run_after_hooks(repo, cfg, which="after_accept") -> dict:
+    out = {}
+    for hook in (cfg.get(which, {}) or {}).get("run", []):
+        try:
+            if hook == "fsck":
+                out["fsck"] = fsckmod.check(repo, strict=False)["result"]
+            elif hook == "verify_signatures":
+                out["signatures"] = "valid" if signmod.verify_all(repo).get("ok") else "issues"
+            elif hook == "backup":
+                out["backup"] = _backup_run_if_configured(repo)
+            elif hook == "push_default_remote":
+                out["push"] = _push_default_if_configured(repo)
+        except Exception as exc:
+            out[hook] = "error: {}".format(exc)
+    return out
+
+
+def _autopilot_accept(repo, cfg, message) -> Optional[int]:
+    """Accept signed by the Owner Agent identity (not the builder, not necessarily the human)."""
+    owner = owneragentmod.owner_identity(repo, cfg)
+    prev = repo.current_identity_id()
+    idmod.set_current(repo, owner["identity_id"])
+    try:
+        return cmd_accept(argparse.Namespace(message=message, no_verify=True, no_sign=False,
+                                             force=False, override=False, reason=None))
+    finally:
+        if prev:
+            idmod.set_current(repo, prev)
+
+
+def _autopilot_review(repo, args) -> int:
+    sess = Session.active(repo)
+    if sess is None:
+        err("no active session"); return 1
+    cfg = owneragentmod.load_config(repo)
+    review = owneragentmod.review_session(repo, sess, cfg)
+    decision = review["decision"]
+    mode = getattr(args, "decision", None)   # auto | escalate | rollback-on-fail | None
+
+    if mode == "rollback-on-fail" and review["verification_summary"] == "failed":
+        decision = "rollback"
+    elif mode == "escalate" and decision == "auto_accept":
+        decision = "escalate"   # operator forced human-in-the-loop
+
+    summary = {"files": review["files_changed"], "ins": review["insertions"], "dels": review["deletions"],
+               "tests": review["verification_summary"], "policy": review["policy_effect"],
+               "owner_agent": review["decision"], "risk": review["risk"],
+               "reasoning": review["reasoning"], "review_id": review["review_id"],
+               "decision": decision}
+
+    if decision == "rollback":
+        cmd_rollback(argparse.Namespace(to_start=False, to_snapshot=None, hard=True,
+                                        keep_files=False, yes=True, keep_session_active=False))
+        summary["action"] = "rolled-back (verification failed)"
+        return _autopilot_finish(args, summary, None, {})
+
+    if decision == "auto_accept":
+        rc = _autopilot_accept(repo, cfg, sess.data.get("instruction"))
+        if rc != 0:
+            summary["action"] = "escalated"; summary["owner_agent"] = "escalate"
+            summary["reasoning"] = "policy gate denied auto-accept at acceptance time"
+            return _autopilot_finish(args, summary, None, {}, escalate=True)
+        snap = repo.head_snapshot()
+        hooks = _run_after_hooks(repo, cfg, "after_accept")
+        ledgermod.append(repo, "autopilot", None, {"id": "autopilot"},
+                         {"action": "auto_accept", "snapshot": snap, "review_id": review["review_id"]})
+        summary["action"] = "auto-accepted"
+        return _autopilot_finish(args, summary, snap, hooks)
+
+    # escalate / request_changes / no_decision
+    summary["action"] = "escalated"
+    return _autopilot_finish(args, summary, None, {}, escalate=True, repo=repo, args2=args)
+
+
+def _autopilot_finish(args, s, snapshot, hooks, escalate=False, repo=None, args2=None) -> int:
+    if getattr(args, "json", False):
+        out = dict(s); out["accepted_snapshot"] = snapshot; out["hooks"] = hooks
+        print(_dump(out))
+        return 0 if not escalate else 0
+    info("")
+    info(util.bold("  Claude changed {} file(s) (+{} -{}).".format(s["files"], s["ins"], s["dels"])))
+    info("")
+    tcol = util.green if s["tests"] == "passed" else (util.yellow if s["tests"] in ("not run", "skipped") else util.red)
+    info("  Tests:        " + tcol(s["tests"]))
+    if escalate:
+        info("  Policy:       " + util.yellow("human required" if s["policy"] != "deny" else util.red("denied")))
+        info("  Owner Agent:  " + util.yellow(s["owner_agent"]))
+        info("  Risk:         " + (util.red(s["risk"]) if s["risk"] == "high" else util.yellow(s["risk"])))
+        info("  Reason:       " + s["reasoning"])
+        info("")
+        if repo is not None:
+            info("  [a] accept manually   [r] rollback   [d] diff   [p] packet   [q] quit")
+            return _claude_review(repo, args2 or args)
+        return 0
+    info("  Policy:       " + util.green("allowed"))
+    info("  Owner Agent:  " + util.green("approved"))
+    info("  Risk:         " + util.green(s["risk"]))
+    info("  Action:       " + util.green(s["action"]))
+    info("  History:      " + ("signed + sealed" if snapshot else "—"))
+    info("  Backup:       " + (hooks.get("backup", "—")))
+    if snapshot:
+        info("")
+        info("  Accepted Snapshot: " + util.cyan(_short(snapshot)))
+    return 0
 
 
 def _claude_review(repo: Repo, args) -> int:
@@ -620,6 +754,218 @@ def _mr_review_loop(ui_base, token, base, args, d) -> int:
         if st == 200:
             d = d2
             _mr_print_screen(d)
+
+
+# ---------------------------------------------------------------------- autopilot / personal / backup
+
+def cmd_autopilot(args) -> int:
+    sub = args.autopilot_cmd
+    if sub == "claude":
+        ns = argparse.Namespace(task=args.task, model=getattr(args, "model", None),
+                                tag=getattr(args, "tag", None), no_tests=getattr(args, "no_tests", False),
+                                no_launch=getattr(args, "no_launch", False), login=getattr(args, "login", False),
+                                autopilot=True, json=getattr(args, "json", False),
+                                decision=getattr(args, "decision", None))
+        return cmd_claude(ns)
+    if sub == "config":
+        repo = _repo()
+        print(_dump(owneragentmod.load_config(repo)))
+        return 0
+    if sub == "review":
+        repo = _repo()
+        sess = Session.active(repo)
+        if sess is None:
+            err("no active session to review (autopilot review currently reviews the active session)")
+            return 1
+        review = owneragentmod.review_session(repo, sess)
+        if getattr(args, "json", False):
+            print(_dump(review)); return 0
+        info(util.bold("Owner Agent review ") + review["review_id"])
+        info("  decision:   {}".format(review["decision"]))
+        info("  risk:       {}  confidence: {}".format(review["risk"], review["confidence"]))
+        info("  reasoning:  {}".format(review["reasoning"]))
+        info("  recommend:  {}".format(review["recommended_action"]))
+        return 0
+    if sub == "status":
+        repo = _repo()
+        rows = [e for e in ledgermod.read_all(repo) if e["event_type"] in ("autopilot", "owner_review")]
+        if not rows:
+            info("No autopilot runs yet."); return 0
+        for e in rows[-15:]:
+            p = e["payload"]
+            info("{}  {}  {}".format(e["timestamp"][:19], e["event_type"],
+                                     p.get("action") or "{} ({})".format(p.get("decision"), p.get("risk"))))
+        return 0
+    err("usage: checkpoint-core autopilot <claude|review|status|config>")
+    return 2
+
+
+def _write_solo_policy(repo) -> None:
+    import copy
+    pol = copy.deepcopy(policymod.DEFAULT_STARTER_POLICY)
+    pol["required_verification"] = {"default": False, "commands": ["tests"]}
+    import yaml
+    with open(policymod.policy_path(repo), "w", encoding="utf-8") as fh:
+        fh.write("# Checkpoint policy (personal preset).\n")
+        fh.write(yaml.safe_dump(pol, sort_keys=False))
+
+
+def cmd_personal(args) -> int:
+    sub = args.personal_cmd or "status"
+    if sub == "init":
+        root = Path.cwd()
+        if not (root / ".checkpoint").exists():
+            rc = cmd_init(argparse.Namespace(branch=None, name=None, email=None, force=False,
+                                             yes=True, safe_git_adapter=False))
+            if rc:
+                return rc
+        repo = _repo()
+        if not repo.current_identity_id():
+            human = idmod.create(repo, name=args.name or "You", id_type="human")
+            info(util.green("Created your identity ") + "{} ({})".format(human["name"], human["identity_id"]))
+        else:
+            info("Using identity {}".format(repo.current_identity_id()))
+        owner = owneragentmod.owner_identity(repo)
+        info(util.green("Owner Agent identity ") + "{} ({})".format(owner["name"], owner["identity_id"]))
+        cfg = owneragentmod.load_config(repo)
+        if getattr(args, "no_autoaccept", False):
+            cfg["default_mode"] = "review_only"
+            cfg["auto_accept_allowed"]["paths"] = []
+        owneragentmod.save_config(repo, cfg)
+        info(util.green("Autopilot config written ") + util.dim("(.checkpoint/autopilot.yaml)"))
+        if policymod.load(repo) is None:
+            _write_solo_policy(repo)
+            info(util.green("Policy preset written ") + util.dim("(protect main, signed accepts; verification optional)"))
+        if getattr(args, "backup_path", None):
+            remotemod.add_remote(repo, "backup", "filesystem", args.backup_path, require_signed_snapshots=False)
+            info(util.green("Backup remote set ") + args.backup_path)
+        info("")
+        info(util.bold("Personal Checkpoint ready.") + " Try:")
+        info('  checkpoint-core claude "Update the README" --autopilot')
+        info("  checkpoint-core personal daily")
+        return 0
+
+    repo = _repo()
+    if sub == "status":
+        cur = idmod.load(repo, repo.current_identity_id()) if repo.current_identity_id() else {}
+        owner = next((i for i in idmod.list_all(repo) if i.get("name") == owneragentmod.OWNER_AGENT_NAME), None)
+        cfg = owneragentmod.load_config(repo)
+        backup = remotemod.list_remotes(repo).get("backup")
+        default = next((n for n in ("checkpoint", "origin") if remotemod.list_remotes(repo).get(n)), None)
+        info(util.bold("Personal status"))
+        info("  identity:     {} ({})".format(cur.get("name", "—"), cur.get("type", "")))
+        info("  owner agent:  {}".format(owner["identity_id"] if owner else util.yellow("not set (run personal init)")))
+        info("  autopilot:    mode={} · auto-accept paths={}".format(
+            cfg.get("default_mode"), ", ".join(cfg.get("auto_accept_allowed", {}).get("paths", [])) or "none"))
+        info("  policy:       {}".format("active" if policymod.load(repo) else "none"))
+        info("  default remote: {}".format(default or "—"))
+        info("  backup:       {}".format(backup.get("path") if backup else "not configured"))
+        try:
+            info("  integrity:    {}".format(fsckmod.check(repo, strict=False)["result"]))
+        except Exception:
+            pass
+        return 0
+
+    if sub == "daily":
+        from datetime import datetime
+        today = util.now_iso()[:10]
+        evs = [e for e in ledgermod.read_all(repo) if e.get("timestamp", "").startswith(today)]
+        def count(t):
+            return sum(1 for e in evs if e["event_type"] == t)
+        autoacc = sum(1 for e in evs if e["event_type"] == "autopilot" and e["payload"].get("action") == "auto_accept")
+        escalated = sum(1 for e in evs if e["event_type"] == "owner_review" and e["payload"].get("decision") == "escalate")
+        open_sessions = [s for s in repo.session_ids()
+                         if (util.read_json(repo.paths.session_dir(s) / "session.json", {}) or {}).get("status") == "active"]
+        backup = remotemod.list_remotes(repo).get("backup")
+        info(util.bold("Today ({})".format(today)))
+        info("  Sessions started: {}".format(count("session_start")))
+        info("  Accepted:         {}  (auto-accepted: {})".format(count("accept"), autoacc))
+        info("  Escalated:        {}".format(escalated))
+        info("  Rolled back:      {}".format(count("rollback")))
+        info("  Open sessions:    {}".format(len(open_sessions)))
+        info("  Verifications:    {}".format(count("verification")))
+        info("  Backup:           {}".format("configured" if backup else "not configured"))
+        try:
+            info("  Integrity:        {}".format(fsckmod.check(repo, strict=False)["result"]))
+            info("  Signatures:       {}".format("valid" if signmod.verify_all(repo).get("ok") else "issues"))
+        except Exception:
+            pass
+        head = repo.head_snapshot()
+        info("  Latest accepted:  {}".format(_short(head) if head else "—"))
+        info("  Branch:           {}".format(repo.head_branch() or "—"))
+        return 0
+
+    err("usage: checkpoint-core personal <init|status|daily>")
+    return 2
+
+
+def _init_store_at(root) -> Repo:
+    """Initialize a bare Checkpoint store at an arbitrary path (for a filesystem backup)."""
+    root = Path(root); root.mkdir(parents=True, exist_ok=True)
+    repo = Repo(root); p = repo.paths
+    if p.config.exists():
+        return repo
+    for d in (p.base, p.objects, p.sessions, p.refs_heads, p.tmp, p.cache):
+        d.mkdir(parents=True, exist_ok=True)
+    if not p.ledger.exists():
+        p.ledger.touch()
+    cfg = Config(default_config(project=root.name), p.config)
+    cfg.data["default_branch"] = "main"; cfg.save(); repo._config = None
+    repo.set_head_to_branch("main")
+    repo.write_state({"active_session": None})
+    ledgermod.append(repo, "init", None, repo.identity(), {"version": __version__, "branch": "main"})
+    return repo
+
+
+def cmd_backup(args) -> int:
+    sub = args.backup_cmd
+    repo = _repo()
+    if sub == "init":
+        if not args.path:
+            err("provide a backup path: checkpoint-core backup init <dir>"); return 2
+        _init_store_at(args.path)                 # backup target must be an initialized store
+        remotemod.add_remote(repo, "backup", "filesystem", args.path, require_signed_snapshots=False)
+        info(util.green("Backup remote configured ") + args.path)
+        return 0
+    spec = remotemod.list_remotes(repo).get("backup")
+    if not spec:
+        err("no backup configured. Run: checkpoint-core backup init <dir>"); return 1
+    if sub == "run":
+        try:
+            res = remotemod.push(repo, "backup", repo.head_branch() or "main", tags=True)
+        except ValueError as exc:
+            err(str(exc)); return 1
+        st = res.get("status")
+        if st in ("pushed", "up-to-date"):
+            info(util.green("Backup synced ") + util.dim("({} object(s))".format(res.get("objects_sent", 0))))
+            return 0
+        err("backup failed: {}".format(st)); return 1
+    if sub == "status":
+        try:
+            stt = remotemod.sync_status(repo, "backup")
+        except Exception as exc:
+            err("backup unreachable: {}".format(exc)); return 1
+        info(util.bold("Backup status") + util.dim("  ({})".format(spec.get("path"))))
+        for b in stt["branches"]:
+            info("  {:<16} {}".format(b["branch"], b["relationship"]))
+        info("  integrity:  {}".format(fsckmod.check(repo, strict=False)["result"]))
+        info("  signatures: {}".format("valid" if signmod.verify_all(repo).get("ok") else "issues"))
+        return 0
+    if sub == "restore":
+        info(util.bold("Restore preview ") + util.dim("(from {})".format(spec.get("path"))))
+        try:
+            report = remotemod.fetch(repo, "backup")
+        except Exception as exc:
+            err("backup unreachable: {}".format(exc)); return 1
+        info("  fetched remote-tracking refs from backup (verified).")
+        if not args.yes:
+            info(util.yellow("  preview only. Re-run with --yes to fast-forward local refs from backup."))
+            return 0
+        rc = cmd_pull(argparse.Namespace(remote="backup", branch=repo.head_branch() or "main",
+                                         branch_opt=None, verify_signatures=True, dry_run=False, json=False))
+        return rc
+    err("usage: checkpoint-core backup <init|run|status|restore>")
+    return 2
 
 
 # ---------------------------------------------------------------------- identity
@@ -2747,8 +3093,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-launch", action="store_true", help="don't launch Claude (you make changes), just review")
     sp.add_argument("--login", action="store_true",
                     help="use the claude.ai login (ignore ANTHROPIC_API_KEY for this run)")
-    sp.add_argument("--decision", choices=["accept", "rollback", "diff", "packet", "quit"],
-                    help="non-interactive decision (default: ask)")
+    sp.add_argument("--autopilot", action="store_true",
+                    help="Owner Agent reviews; auto-accept low-risk work or escalate")
+    sp.add_argument("--json", action="store_true", help="machine-readable run summary (autopilot)")
+    sp.add_argument("--decision",
+                    choices=["accept", "rollback", "diff", "packet", "quit",
+                             "auto", "escalate", "rollback-on-fail"],
+                    help="non-interactive decision (default: ask). auto/escalate/rollback-on-fail are autopilot modes")
     sp.set_defaults(func=cmd_claude)
 
     # ---- mr: scriptable merge-request review surface (talks to the hosted remote) ----
@@ -2791,6 +3142,42 @@ def build_parser() -> argparse.ArgumentParser:
                     help="non-interactive action (default: ask)")
 
     mp.set_defaults(func=cmd_mr, mr_cmd=None)
+
+    # ---- autopilot: builder + owner-agent loop ----
+    ap = sub.add_parser("autopilot", help="Owner Agent loop: claude/review/status/config")
+    apsub = ap.add_subparsers(dest="autopilot_cmd")
+    apc = apsub.add_parser("claude", help="run the builder + owner-agent autopilot flow")
+    apc.add_argument("task")
+    apc.add_argument("--model"); apc.add_argument("--tag", action="append")
+    apc.add_argument("--no-tests", action="store_true"); apc.add_argument("--no-launch", action="store_true")
+    apc.add_argument("--login", action="store_true"); apc.add_argument("--json", action="store_true")
+    apc.add_argument("--decision", choices=["auto", "escalate", "rollback-on-fail"])
+    apr = apsub.add_parser("review", help="run Owner Agent review on the active session")
+    apr.add_argument("--json", action="store_true")
+    apsub.add_parser("status", help="recent autopilot runs")
+    apsub.add_parser("config", help="show the active autopilot config")
+    ap.set_defaults(func=cmd_autopilot, autopilot_cmd=None)
+
+    # ---- personal: one-power-user setup + status + daily ----
+    pp = sub.add_parser("personal", help="personal setup: init/status/daily")
+    ppsub = pp.add_subparsers(dest="personal_cmd")
+    ppi = ppsub.add_parser("init", help="configure Checkpoint for personal use")
+    ppi.add_argument("--name", help="your human identity name")
+    ppi.add_argument("--backup-path", dest="backup_path", help="filesystem backup remote path")
+    ppi.add_argument("--no-autoaccept", action="store_true", dest="no_autoaccept",
+                     help="review-only mode (don't auto-accept anything)")
+    ppsub.add_parser("status", help="identity / owner-agent / backup / policy / health")
+    ppsub.add_parser("daily", help="today's accepted/escalated/rolled-back/open work")
+    pp.set_defaults(func=cmd_personal, personal_cmd=None)
+
+    # ---- backup: personal filesystem backup of accepted history ----
+    bp = sub.add_parser("backup", help="personal backup: init/run/status/restore")
+    bpsub = bp.add_subparsers(dest="backup_cmd")
+    bpi = bpsub.add_parser("init"); bpi.add_argument("path")
+    bpsub.add_parser("run")
+    bpsub.add_parser("status")
+    bpr = bpsub.add_parser("restore"); bpr.add_argument("--yes", action="store_true")
+    bp.set_defaults(func=cmd_backup, backup_cmd=None)
 
     sp = sub.add_parser("setup",
                         help="one-shot: init + identity + ignore + remote + server repo + policy")

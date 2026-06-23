@@ -416,6 +416,13 @@ read the rename-aware diff, leave **inline line comments**, **approve** (with po
 `min_approvals` enforcement), and **merge** — server-signed, conflict-aware, and atomic, so
 two people can't destroy each other's work. See [`docs/reviews.md`](docs/reviews.md).
 
+**Personal Autopilot** makes it an AI-owned loop for a power user:
+`checkpoint-core claude "Fix the bug" --autopilot` → Claude writes the code, a separate
+**Owner Agent** reviews it from your perspective, **policy** decides what AI may accept,
+**low-risk** changes auto-accept (signed + sealed), and **risky** changes escalate to you with
+a clear reason. Plus `personal init/daily` and filesystem `backup`. See
+[`docs/personal-autopilot.md`](docs/personal-autopilot.md).
+
 The **session review page** puts the whole work episode on one screen — instruction,
 agent/model/tool, timeline, rename-aware diff, packet, policy decision (allow/deny + reasons
 + required actions), signatures & trust (signer identity/type, trusted/untrusted/unknown/

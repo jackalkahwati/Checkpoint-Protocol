@@ -15,3 +15,14 @@ Protocol-level guarantees (see [checkpoint-core-protocol.md](checkpoint-core-pro
 
 Preview caveats: no TLS in the bundled server, local token auth, local trust only. Front
 the server with HTTPS and use scoped tokens.
+
+## Owner Agent (personal autopilot) invariants
+
+The Owner Agent is **deterministic** (rule-based, not an LLM) and bounded by your config +
+the policy engine. Enforced: the Owner Agent is a **separate identity** from the Builder
+(the Builder never self-approves); it **cannot override or loosen policy** (policy denial
+always escalates); it **cannot trust identities**; it auto-accepts/auto-merges only when the
+config allow-list **and** policy both permit; it cannot auto-merge failed tests, unresolved
+comments, conflicts, or unsigned/untrusted history when policy requires signatures. Auto-accept
+and auto-merge are ledgered and signed where possible. Backups never include private keys. See
+[owner-agent.md](owner-agent.md).

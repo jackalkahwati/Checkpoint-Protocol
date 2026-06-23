@@ -35,6 +35,7 @@ say "docs present"
 for f in README.md CHANGELOG.md RELEASE_NOTES.md SECURITY.md CONTRIBUTING.md ROADMAP.md \
          docs/quickstart.md docs/concepts.md docs/cli-reference.md docs/agent-integration.md \
          docs/faq.md docs/server.md docs/web-ui.md docs/reviews.md docs/security-model.md \
+         docs/personal-autopilot.md docs/owner-agent.md docs/backup.md docs/daily-workflow.md \
          docs/protocol-conformance.md docs/git-bridge.md docs/checkpoint-core-protocol.md \
          docs/checkpoint-hosted-api.md docs/checkpoint-web-ui.md; do
   test -f "$f" && ok "$f" || bad "missing $f"
