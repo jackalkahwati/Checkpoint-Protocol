@@ -6,6 +6,7 @@ export type SessionStatus =
   | "accepted"
   | "rejected"
   | "rolled_back"
+  | "abandoned"
   | "merged"
 
 export type ActorType = "human" | "agent" | "ci" | "machine" | "service"

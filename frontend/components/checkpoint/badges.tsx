@@ -74,14 +74,16 @@ export function Pill({ tone, icon: Icon, children, tip, className, mono }: PillP
 }
 
 export function StatusBadge({ status }: { status: SessionStatus }) {
-  const map: Record<SessionStatus, { tone: Tone; icon: LucideIcon; label: string; tip: string }> = {
+  const map: Record<string, { tone: Tone; icon: LucideIcon; label: string; tip: string }> = {
     active: { tone: "info", icon: CircleDashed, label: "Active", tip: "Session is in progress" },
     accepted: { tone: "success", icon: CheckCircle2, label: "Accepted", tip: "Reviewed and added to accepted history" },
     rejected: { tone: "danger", icon: XCircle, label: "Rejected", tip: "Session was rejected" },
     rolled_back: { tone: "warning", icon: CircleDashed, label: "Rolled back", tip: "Session was rolled back" },
+    abandoned: { tone: "neutral", icon: CircleDashed, label: "Abandoned", tip: "Superseded session, cleaned up by prune" },
     merged: { tone: "info", icon: GitMerge, label: "Merged", tip: "Session was merged" },
   }
-  const c = map[status]
+  // Never let an unknown status white-screen the repo — fall back to a neutral pill.
+  const c = map[status] ?? { tone: "neutral" as Tone, icon: CircleDashed, label: String(status), tip: "Unknown status" }
   return (
     <Pill tone={c.tone} icon={c.icon} tip={c.tip}>
       {c.label}
