@@ -344,3 +344,13 @@ def test_single_file_protected_modules_escalate():
         assert _decide(changed_paths=[f])["decision"] == "escalate", f
     # and the allow-list is unaffected (no false escalation of docs)
     assert _decide(changed_paths=["docs/x.md", "README.md"], files_changed=2)["decision"] == "auto_accept"
+
+
+def test_owner_review_signature_verifies(repo):
+    # a signed Owner Agent review must verify under verify_all (not show up as "issues")
+    (repo / "docs" / "guide.md").write_text("intro\nsig\n")
+    run(["claude", "docs", "--autopilot", "--no-launch", "--no-tests", "--decision", "auto"])
+    from checkpoint_core import sign as s
+    r = _repo(repo)
+    assert s.verify_all(r)["ok"]
+    assert any(rec.get("signed_object_type") == "owner_review" for rec in s.iter_all(r))

@@ -131,6 +131,16 @@ def _rebuild_payload(repo: Repo, record: Dict[str, Any]) -> Optional[Dict[str, A
         except Exception:
             return None
         return snapshot_payload(snap, oid, record["signer_identity_id"])
+    if t == "owner_review":
+        # Owner Agent review attestation: the signed payload is the persisted review record
+        # as it was at signing time (before signed_review / ledger_event_id were filled in).
+        data = util.read_json(repo.paths.base / "owner_reviews" / (oid + ".json"), None)
+        if not data:
+            return None
+        payload = dict(data)
+        payload["signed_review"] = None
+        payload["ledger_event_id"] = None
+        return payload
     if t == "tag":
         # tag target is recorded in the signature's own payload-bound fields
         return None  # tag verification handled via stored payload (future); snapshots are primary
