@@ -2,6 +2,18 @@
 
 All notable changes to Checkpoint. Versions are tagged in Git.
 
+## v1.2.1 — Owner Agent Autopilot completion
+- `autopilot review mr_N [--decision approve|merge]`: Owner Agent reviews a merge request and
+  acts only when its decision AND server policy permit (protected/policy-deny → escalate, no
+  action).
+- `autopilot explain [id]`: explain a past decision (reads the persisted, signed review).
+- Reviews are now **persisted** (`.checkpoint/owner_reviews/<id>.json`, loadable by review or
+  target id) with `ledger_event_id` and `policy_decision_id`.
+- `checkpoint_core/identity/**` added to default protected paths.
+- `next --json` exposes `autopilot_enabled`, `owner_agent_configured`, `last_owner_agent_review`,
+  `autopilot_recommended`, `autopilot_safe_to_run`, `suggested_autopilot_command` so
+  `/checkpoint` routes into autopilot.
+
 ## v1.2 — Personal Autopilot (AI-owned loop)
 - `checkpoint-core claude "<task>" --autopilot` (and `autopilot claude`): Builder writes →
   **Owner Agent** reviews → auto-accept low-risk work or **escalate** with a clear reason →

@@ -48,3 +48,27 @@ policy_effect, recommended_action, signed_review`.
 
 Config lives in `.checkpoint/autopilot.yaml` (`checkpoint-core autopilot config`). Tighten or
 loosen the allow-lists there; it starts conservative.
+
+## Commands
+
+```
+checkpoint-core claude "<task>" --autopilot [--decision auto|escalate|rollback-on-fail] [--login] [--json]
+checkpoint-core autopilot claude "<task>"        # same flow
+checkpoint-core autopilot review                  # review the active session
+checkpoint-core autopilot review mr_N [--decision approve|merge] [--json]   # review an MR; act only if policy + OA allow
+checkpoint-core autopilot explain [<review_id|target_id>] [--json]          # why it decided what it did
+checkpoint-core autopilot status                  # recent runs
+checkpoint-core autopilot config                  # active rules
+```
+
+Reviews are **persisted** under `.checkpoint/owner_reviews/<review_id>.json` (loadable by
+`review_id` or `target_id`), each carrying a `ledger_event_id` and (when an Owner Agent
+identity exists) a `signed_review`. `autopilot explain` reads these back.
+
+For MR review, the Owner Agent only **approves**/**merges** when its own decision permits AND
+the server-side policy allows the call — it never forces a merge. Protected-path or
+policy-deny MRs return `escalate` and take no action.
+
+`checkpoint-core next --json` exposes `autopilot_enabled`, `owner_agent_configured`,
+`last_owner_agent_review`, `autopilot_recommended`, `autopilot_safe_to_run`, and
+`suggested_autopilot_command` so `/checkpoint` can route into autopilot when appropriate.

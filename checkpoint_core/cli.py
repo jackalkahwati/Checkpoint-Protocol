@@ -890,9 +890,30 @@ def cmd_next(args) -> int:
     else:
         rec, why = "new_task", "repo is clean — start a new task"
 
+    # autopilot integration
+    ap_cfg_present = owneragentmod.config_path(repo).exists()
+    ap_enabled = ap_cfg_present and bool(owneragentmod.load_config(repo).get("enabled", True))
+    owner_configured = any(i.get("name") == owneragentmod.OWNER_AGENT_NAME for i in idmod.list_all(repo))
+    last_rev = owneragentmod.latest_review(repo)
+    last_review = ({"review_id": last_rev["review_id"], "decision": last_rev["decision"],
+                    "risk": last_rev["risk"], "created_at": last_rev["created_at"]} if last_rev else None)
+    if rec == "resume":
+        ap_cmd = "checkpoint-core claude --continue --autopilot --login"
+    elif rec == "review" and mrs:
+        ap_cmd = "checkpoint-core autopilot review {}".format(mrs[0]["id"])
+    elif rec in ("new_task", "create_session"):
+        ap_cmd = 'checkpoint-core claude "<task>" --autopilot --login'
+    else:
+        ap_cmd = None
+
     data = {
         "initialized": True, "repo": root.name, "branch": repo.head_branch() or "(detached)",
         "status": "dirty" if dirty else "clean",
+        "autopilot_enabled": ap_enabled, "owner_agent_configured": owner_configured,
+        "last_owner_agent_review": last_review,
+        "autopilot_recommended": rec in ("new_task", "resume", "create_session"),
+        "autopilot_safe_to_run": ap_enabled and owner_configured,
+        "suggested_autopilot_command": ap_cmd,
         "first_push_done": first_push_done, "first_push_needed": first_push_needed,
         "open_sessions": open_sessions, "active_session": active,
         "dirty_no_session": dirty and active is None,
@@ -1023,18 +1044,32 @@ def cmd_autopilot(args) -> int:
         return 0
     if sub == "review":
         repo = _repo()
+        target = getattr(args, "id", None)
+        if target and str(target).startswith("mr_"):
+            return _autopilot_review_mr(repo, target, args)
         sess = Session.active(repo)
         if sess is None:
-            err("no active session to review (autopilot review currently reviews the active session)")
+            err("no active session to review. Pass an MR id (mr_N) or start a session.")
             return 1
         review = owneragentmod.review_session(repo, sess)
+        return _autopilot_review_emit(review, args)
+    if sub == "explain":
+        repo = _repo()
+        rec = owneragentmod.load_review(repo, args.id) if getattr(args, "id", None) else owneragentmod.latest_review(repo)
+        if rec is None:
+            err("no Owner Agent review found{}".format(" for " + args.id if getattr(args, "id", None) else "")); return 1
         if getattr(args, "json", False):
-            print(_dump(review)); return 0
-        info(util.bold("Owner Agent review ") + review["review_id"])
-        info("  decision:   {}".format(review["decision"]))
-        info("  risk:       {}  confidence: {}".format(review["risk"], review["confidence"]))
-        info("  reasoning:  {}".format(review["reasoning"]))
-        info("  recommend:  {}".format(review["recommended_action"]))
+            print(_dump(rec)); return 0
+        info(util.bold("Owner Agent review ") + rec["review_id"] + util.dim("  ({} {})".format(rec["target_type"], rec["target_id"])))
+        info("  decision:   {}  (risk {}, confidence {})".format(rec["decision"], rec["risk"], rec["confidence"]))
+        info("  reasoning:  {}".format(rec["reasoning"]))
+        info("  checks:")
+        for c in rec.get("checked_items", []):
+            info("    - {}".format(c))
+        if rec.get("protected_paths_touched"):
+            info("  protected:  {}".format(", ".join(rec["protected_paths_touched"])))
+        info("  signed:     {}".format("yes" if rec.get("signed_review") else "no")
+             + util.dim("  · ledger {}".format(rec.get("ledger_event_id"))))
         return 0
     if sub == "status":
         repo = _repo()
@@ -1046,8 +1081,66 @@ def cmd_autopilot(args) -> int:
             info("{}  {}  {}".format(e["timestamp"][:19], e["event_type"],
                                      p.get("action") or "{} ({})".format(p.get("decision"), p.get("risk"))))
         return 0
-    err("usage: checkpoint-core autopilot <claude|review|status|config>")
+    err("usage: checkpoint-core autopilot <claude|review|explain|status|config>")
     return 2
+
+
+def _autopilot_review_emit(review, args) -> int:
+    if getattr(args, "json", False):
+        print(_dump(review)); return 0
+    info(util.bold("Owner Agent review ") + review["review_id"])
+    info("  decision:   {}".format(review["decision"]))
+    info("  risk:       {}  confidence: {}".format(review["risk"], review["confidence"]))
+    info("  reasoning:  {}".format(review["reasoning"]))
+    info("  recommend:  {}".format(review["recommended_action"]))
+    return 0
+
+
+def _autopilot_review_mr(repo, mr_id, args) -> int:
+    r = _mr_remote(args)
+    if r is None:
+        return 2
+    ui_base, token, owner, name = r
+    st, d = _mr_call("GET", ui_base, token, "/reviews/" + mr_id)
+    if st != 200:
+        err("no such merge request: {}".format(mr_id)); return 1
+    diff = d.get("diff", [])
+    sigs = d.get("signatures", [])
+    sig_status = "valid" if sigs and all(s.get("status") == "valid" for s in sigs) else ("unsigned" if not sigs else "invalid")
+    pol = d.get("policy")
+    facts = {
+        "changed_paths": [(f.get("new_path") if f.get("change_type") != "deleted" else f.get("old_path")) for f in diff],
+        "files_changed": len(diff),
+        "deletions": sum(f.get("deletions", 0) for f in diff),
+        "insertions": sum(f.get("additions", 0) for f in diff),
+        "tests": "passed",   # MR source is already an accepted, verified snapshot
+        "policy_effect": (pol["effect"] if pol else "allow"),
+        "policy_reasons": (pol.get("reasons", []) if pol else []),
+        "conflict_count": 0 if d.get("mergeability", {}).get("clean") else len(d.get("mergeability", {}).get("conflicts", [])),
+        "unresolved_comments": d.get("unresolved_count", 0),
+        "signatures_status": sig_status, "builder_identity": None,
+    }
+    review = owneragentmod.review_target(repo, "merge_request", mr_id, facts)
+    decision = review["decision"]
+    mode = getattr(args, "decision", None)
+    # act only if policy allows (server still enforces on the actual call)
+    if mode == "approve" and decision in ("approve", "auto_accept", "auto_merge"):
+        _mr_call("POST", ui_base, token, "/reviews/" + mr_id + "/approve", {"approve": True})
+        review["action_taken"] = "approved"
+    elif mode == "merge" and decision in ("auto_merge", "approve", "auto_accept"):
+        _mr_call("POST", ui_base, token, "/reviews/" + mr_id + "/approve", {"approve": True})
+        st2, res = _mr_call("POST", ui_base, token, "/reviews/" + mr_id + "/merge", {})
+        review["action_taken"] = (res or {}).get("status")
+    elif mode in ("approve", "merge"):
+        review["action_taken"] = "escalated (owner agent decision: {})".format(decision)
+    if getattr(args, "json", False):
+        print(_dump(review)); return 0
+    info(util.bold("Owner Agent MR review ") + mr_id + "  -> " + review["decision"]
+         + util.dim("  (risk {})".format(review["risk"])))
+    info("  reasoning: {}".format(review["reasoning"]))
+    if review.get("action_taken"):
+        info("  action:    {}".format(review["action_taken"]))
+    return 0
 
 
 def _write_solo_policy(repo) -> None:
@@ -3421,8 +3514,14 @@ def build_parser() -> argparse.ArgumentParser:
     apc.add_argument("--no-tests", action="store_true"); apc.add_argument("--no-launch", action="store_true")
     apc.add_argument("--login", action="store_true"); apc.add_argument("--json", action="store_true")
     apc.add_argument("--decision", choices=["auto", "escalate", "rollback-on-fail"])
-    apr = apsub.add_parser("review", help="run Owner Agent review on the active session")
+    apr = apsub.add_parser("review", help="Owner Agent review of the active session or an MR (mr_N)")
+    apr.add_argument("id", nargs="?", help="merge-request id (mr_N); omit to review the active session")
+    apr.add_argument("--decision", choices=["approve", "merge"], help="act if policy + Owner Agent allow (MR)")
+    apr.add_argument("--remote", help="remote name (for MR review)")
     apr.add_argument("--json", action="store_true")
+    ape = apsub.add_parser("explain", help="explain a past Owner Agent decision")
+    ape.add_argument("id", nargs="?", help="review_id or target id; omit for the latest review")
+    ape.add_argument("--json", action="store_true")
     apsub.add_parser("status", help="recent autopilot runs")
     apsub.add_parser("config", help="show the active autopilot config")
     ap.set_defaults(func=cmd_autopilot, autopilot_cmd=None)

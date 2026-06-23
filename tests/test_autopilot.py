@@ -218,3 +218,97 @@ def test_backup_status_after_run(repo, tmp_path, capsys):
     capsys.readouterr()
     assert run(["backup", "status"]) == 0
     assert "Backup status" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- v1.2 deltas
+
+def test_identity_path_escalates():
+    assert _decide(changed_paths=["checkpoint_core/identity/store.py"])["decision"] == "escalate"
+
+
+def test_review_persisted_signed_and_ledgered(repo):
+    from checkpoint_core import owneragent as oa
+    (repo / "docs" / "guide.md").write_text("intro\nx\n")
+    run(["start", "edit", "--no-watch"])
+    rev = oa.review_session(_repo(repo), _active(repo))
+    assert rev.get("ledger_event_id") and "policy_decision_id" in rev and rev.get("signed_review")
+    # persisted + loadable by review_id AND by target id
+    r = _repo(repo)
+    assert oa.load_review(r, rev["review_id"])["decision"] == rev["decision"]
+    assert oa.load_review(r, rev["target_id"])["review_id"] == rev["review_id"]
+    assert oa.latest_review(r)["review_id"] == rev["review_id"]
+    run(["rollback", "--hard", "--yes"])
+
+
+def test_autopilot_explain(repo, capsys):
+    (repo / "docs" / "guide.md").write_text("intro\nexplain\n")
+    run(["claude", "docs", "--autopilot", "--no-launch", "--no-tests", "--decision", "auto"])
+    capsys.readouterr()
+    assert run(["autopilot", "explain"]) == 0
+    out = capsys.readouterr().out
+    assert "Owner Agent review" in out and "decision:" in out and "reasoning:" in out
+
+
+def test_next_includes_autopilot_fields(repo, capsys):
+    run(["first-push", "--yes", "--dest", str(repo.parent / "bk_ap")])
+    run(["next", "--json"])
+    out = capsys.readouterr().out
+    d = json.loads(out[out.index("{"):])
+    for k in ("autopilot_enabled", "owner_agent_configured", "autopilot_recommended",
+              "autopilot_safe_to_run", "suggested_autopilot_command", "last_owner_agent_review"):
+        assert k in d
+    assert d["autopilot_enabled"] is True and d["owner_agent_configured"] is True
+
+
+def _live_mr(tmp_path, monkeypatch, feature_file, content):
+    import socket, threading, time
+    from checkpoint_core.server.store import ServerStore
+    from checkpoint_core.server.app import serve
+    from checkpoint_core import remote as RM
+    store = ServerStore.init_store(tmp_path / "srv")
+    admin = store.create_token("admin", ["admin"], "*")["token"]
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    httpd = serve(store, "127.0.0.1", port)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start(); time.sleep(0.15)
+    url = "http://127.0.0.1:{}".format(port)
+    RM._http("POST", url + "/repos", admin, {"owner": "o", "repo": "r"})
+    work = tmp_path / "w"; work.mkdir(); monkeypatch.chdir(work)
+    run(["personal", "init", "--name", "Jack"])
+    (work / "README.md").write_text("base\n"); run(["start", "b", "--no-watch"]); run(["accept", "--force", "-m", "b"])
+    run(["branch", "feat"]); run(["checkout", "feat"])
+    p = work / feature_file; p.parent.mkdir(parents=True, exist_ok=True); p.write_text(content)
+    run(["start", "f", "--no-watch"]); run(["accept", "--force", "-m", "f"])
+    run(["checkout", "main"])
+    run(["remote", "add", "checkpoint", "{}/o/r".format(url), "--token", admin])
+    run(["push", "checkpoint", "main"]); run(["push", "checkpoint", "feat"])
+    for i in RM._http("GET", url + "/repos/o/r/identities", admin)[1]["identities"]:
+        RM._http("POST", "{}/repos/o/r/identities/{}/trust".format(url, i["identity_id"]), admin)
+    RM._http("POST", "{}/ui/repos/o/r/reviews".format(url), admin,
+             {"title": "t", "source_branch": "feat", "target_branch": "main"})
+    return httpd, url, admin
+
+
+def test_autopilot_review_mr_docs_approves(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("NO_COLOR", "1")
+    httpd, url, admin = _live_mr(tmp_path, monkeypatch, "docs/new.md", "# docs\n")
+    try:
+        capsys.readouterr()
+        assert run(["autopilot", "review", "mr_1", "--decision", "approve", "--json"]) == 0
+        d = json.loads(capsys.readouterr().out)
+        assert d["decision"] in ("auto_accept", "approve", "auto_merge")
+        assert d.get("action_taken") == "approved"
+    finally:
+        httpd.shutdown()
+
+
+def test_autopilot_review_mr_protected_escalates(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("NO_COLOR", "1")
+    httpd, url, admin = _live_mr(tmp_path, monkeypatch, "checkpoint_core/policy/x.py", "x=1\n")
+    try:
+        capsys.readouterr()
+        run(["autopilot", "review", "mr_1", "--decision", "approve", "--json"])
+        d = json.loads(capsys.readouterr().out)
+        assert d["decision"] == "escalate"
+        assert "escalated" in (d.get("action_taken") or "")
+    finally:
+        httpd.shutdown()

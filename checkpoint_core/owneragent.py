@@ -49,8 +49,8 @@ DEFAULT_AUTOPILOT: Dict[str, Any] = {
     },
     "escalate_to_human": {
         "paths": ["checkpoint_core/policy", "checkpoint_core/sign", "checkpoint_core/remote",
-                  "checkpoint_core/server", "checkpoint_core/merge", "src/auth", "src/security",
-                  "firmware/", "migrations/"],
+                  "checkpoint_core/server", "checkpoint_core/merge", "checkpoint_core/identity",
+                  "src/auth", "src/security", "firmware/", "migrations/"],
         "conditions": ["tests_failed", "policy_denied", "merge_conflict", "unresolved_comments",
                        "files_changed_more_than", "deletions_more_than", "unsigned_history",
                        "untrusted_signer", "builder_agent_is_same_as_owner_agent", "changes_policy",
@@ -195,41 +195,84 @@ def _session_facts(repo: Repo, sess: Session) -> Dict[str, Any]:
             "signatures_status": "unsigned", "builder_identity": builder}
 
 
-def review_session(repo: Repo, sess: Session, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Run the Owner Agent over an active session; ledger + sign the review; return it."""
+def _reviews_dir(repo: Repo):
+    d = repo.paths.base / "owner_reviews"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def load_review(repo: Repo, key: str) -> Optional[Dict[str, Any]]:
+    """Load a persisted review by review_id or by target_id (most recent for that target)."""
+    p = _reviews_dir(repo) / (key + ".json")
+    if p.exists():
+        return util.read_json(p, None)
+    best, best_at = None, ""
+    for f in _reviews_dir(repo).glob("rev_*.json"):
+        rec = util.read_json(f, None)
+        if rec and rec.get("target_id") == key and rec.get("created_at", "") >= best_at:
+            best, best_at = rec, rec.get("created_at", "")
+    return best
+
+
+def latest_review(repo: Repo) -> Optional[Dict[str, Any]]:
+    best, best_at = None, ""
+    for f in _reviews_dir(repo).glob("rev_*.json"):
+        rec = util.read_json(f, None)
+        if rec and rec.get("created_at", "") >= best_at:
+            best, best_at = rec, rec.get("created_at", "")
+    return best
+
+
+def review_target(repo: Repo, target_type: str, target_id: str, facts: Dict[str, Any],
+                  cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Decide on prepared facts for a session or MR; persist + ledger + sign; return the record.
+
+    The Owner Agent never overrides/loosens policy or trusts identities: facts carry the
+    policy effect and we only ever ESCALATE on policy-deny, never auto-accept past it.
+    """
     cfg = cfg or load_config(repo)
     owner = owner_identity(repo, cfg)
-    facts = _session_facts(repo, sess)
     facts["builder_is_owner"] = bool(facts.get("builder_identity")) and facts["builder_identity"] == owner["identity_id"]
     d = decide(facts, cfg)
+    stamp = util.now_iso().replace(":", "").replace("-", "").replace("T", "").replace("+", "").replace(".", "")
+    rid = "rev_" + stamp[:18] + "_" + target_id[:12]
     review = {
-        "review_id": util.seq_id("rev", sess.next_seq("owner_review")) if hasattr(sess, "next_seq") else util.event_id(),
-        "target_type": "session", "target_id": sess.id,
+        "review_id": rid, "target_type": target_type, "target_id": target_id,
         "owner_agent_identity_id": owner["identity_id"],
         "builder_agent_identity_id": facts.get("builder_identity"),
         "created_at": util.now_iso(),
         "decision": d["decision"], "confidence": d["confidence"], "risk": d["risk"],
         "reasoning": d["reasoning"], "checked_items": d["checked_items"],
-        "verification_summary": facts["tests"],
-        "changed_paths": facts["changed_paths"][:50],
+        "verification_summary": facts.get("tests"),
+        "changed_paths": facts.get("changed_paths", [])[:50],
         "protected_paths_touched": d["protected_paths_touched"],
-        "unresolved_comments_count": facts["unresolved_comments"],
-        "conflict_count": facts["conflict_count"],
-        "signatures_status": facts["signatures_status"],
-        "policy_effect": facts["policy_effect"],
-        "files_changed": facts["files_changed"], "deletions": facts["deletions"],
-        "insertions": facts["insertions"],
+        "unresolved_comments_count": facts.get("unresolved_comments", 0),
+        "conflict_count": facts.get("conflict_count", 0),
+        "signatures_status": facts.get("signatures_status", "unsigned"),
+        "policy_effect": facts.get("policy_effect"),
+        "policy_decision_id": facts.get("policy_decision_id"),
+        "files_changed": facts.get("files_changed", 0), "deletions": facts.get("deletions", 0),
+        "insertions": facts.get("insertions", 0),
         "recommended_action": d["recommended_action"],
+        "signed_review": None, "ledger_event_id": None,
     }
-    # sign the review (independent owner-agent attestation) when configured + identity exists
     if cfg.get("owner_agent", {}).get("sign_reviews", True):
         try:
-            sig = signmod.sign_payload(repo, "owner_review", review["review_id"], review, owner["identity_id"])
+            sig = signmod.sign_payload(repo, "owner_review", rid, review, owner["identity_id"])
             review["signed_review"] = {"signer": owner["identity_id"], "signature_id": sig.get("signature_id")}
         except Exception:
             review["signed_review"] = None
-    ledgermod.append(repo, "owner_review", sess.id,
-                     {"id": owner["identity_id"], "name": owner.get("name")},
-                     {k: review[k] for k in ("review_id", "decision", "risk", "confidence",
-                                             "reasoning", "protected_paths_touched", "policy_effect")})
+    ev = ledgermod.append(repo, "owner_review", target_id if target_type == "session" else None,
+                          {"id": owner["identity_id"], "name": owner.get("name")},
+                          {k: review[k] for k in ("review_id", "target_type", "target_id", "decision",
+                                                  "risk", "confidence", "reasoning",
+                                                  "protected_paths_touched", "policy_effect")})
+    review["ledger_event_id"] = ev.get("event_id")
+    util.write_json(_reviews_dir(repo) / (rid + ".json"), review)   # persisted + inspectable
     return review
+
+
+def review_session(repo: Repo, sess: Session, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Run the Owner Agent over an active session; persist + ledger + sign; return the review."""
+    facts = _session_facts(repo, sess)
+    return review_target(repo, "session", sess.id, facts, cfg)
