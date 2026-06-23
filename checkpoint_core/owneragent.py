@@ -100,7 +100,9 @@ def _match_any(path: str, patterns: List[str]) -> bool:
         pat = pat.rstrip("/")
         if policymod.path_matches(pat, p) or policymod.path_matches(pat + "/**", p):
             return True
-        if p == pat or p.startswith(pat + "/"):
+        # match the directory form (foo/bar/…) AND the single-file module form (foo/bar.py),
+        # so "checkpoint_core/policy" guards both checkpoint_core/policy/** and checkpoint_core/policy.py.
+        if p == pat or p.startswith(pat + "/") or p.startswith(pat + "."):
             return True
     return False
 

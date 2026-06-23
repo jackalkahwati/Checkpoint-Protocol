@@ -335,3 +335,12 @@ def test_autopilot_backup_unreachable_accepts_locally(repo, capsys, tmp_path):
     out = capsys.readouterr().out
     assert "auto-accepted" in out and "not reachable" in out and "accepted locally" in out
     assert _repo(repo).head_snapshot()                  # history not corrupted
+
+
+def test_single_file_protected_modules_escalate():
+    # checkpoint-core's own sensitive code lives in single files, not dirs — must still escalate
+    for f in ["checkpoint_core/policy.py", "checkpoint_core/sign.py", "checkpoint_core/identity.py",
+              "checkpoint_core/remote.py", "checkpoint_core/server.py"]:
+        assert _decide(changed_paths=[f])["decision"] == "escalate", f
+    # and the allow-list is unaffected (no false escalation of docs)
+    assert _decide(changed_paths=["docs/x.md", "README.md"], files_changed=2)["decision"] == "auto_accept"
