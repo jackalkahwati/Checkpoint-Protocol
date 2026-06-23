@@ -416,6 +416,12 @@ read the rename-aware diff, leave **inline line comments**, **approve** (with po
 `min_approvals` enforcement), and **merge** — server-signed, conflict-aware, and atomic, so
 two people can't destroy each other's work. See [`docs/reviews.md`](docs/reviews.md).
 
+**`/checkpoint` is the repo concierge** — the simplest way to work. Call it in any repo; it
+inspects the state (`checkpoint-core next`), tells you where things stand, recommends the next
+move (resume a session, review an MR, back up, or start a task), and lets you type your own. A
+new repo? It offers to initialize and, with your confirmation, do the first push/backup (no
+private keys, no autosaves; verified). See [`docs/checkpoint-skill.md`](docs/checkpoint-skill.md).
+
 **Personal Autopilot** makes it an AI-owned loop for a power user:
 `checkpoint-core claude "Fix the bug" --autopilot` → Claude writes the code, a separate
 **Owner Agent** reviews it from your perspective, **policy** decides what AI may accept,

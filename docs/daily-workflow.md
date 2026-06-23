@@ -1,6 +1,11 @@
 # Daily Workflow
 
-The terminal-native, AI-owned loop for one power user:
+**The simplest entry point is `/checkpoint`** — the repo concierge. Call it in any repo and it
+inspects the state, tells you where things stand, recommends the next move, and lets you type
+your own. New repo? It offers to initialize and (with your yes) do the first push/backup. After
+that it just shows a summary + suggested directions. See [checkpoint-skill.md](checkpoint-skill.md).
+
+Under the hood `/checkpoint` runs `checkpoint-core next`. The terminal-native, AI-owned loop:
 
 ```bash
 checkpoint-core personal init                       # once

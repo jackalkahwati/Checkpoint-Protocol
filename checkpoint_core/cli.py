@@ -271,7 +271,15 @@ def _print_claude_summary(s: dict) -> None:
 
 
 def cmd_claude(args) -> int:
-    import os as _os, shlex as _shlex, subprocess as _sub
+    # Resume an open session (concierge "continue").
+    if getattr(args, "cont", False):
+        repo = _repo()
+        sess = Session.active(repo)
+        if sess is None:
+            err('no open session to continue. Start one: checkpoint-core claude "<task>"')
+            return 1
+        return _claude_finish(repo, sess.data.get("instruction", "(continue)"), args, resuming=True)
+
     task = (args.task or "").strip()
     if not task:
         err('a task is required: checkpoint-core claude "<what to do>"')
@@ -288,32 +296,36 @@ def cmd_claude(args) -> int:
         idmod.create(repo, name="You", id_type="human")
         repo = _repo()
     if Session.active(repo) is not None:
-        err("a session is already active ({}). Finish it first (accept/rollback).".format(
-            repo.active_session_id()))
+        err("a session is already active ({}). Resume it: checkpoint-core claude --continue, "
+            "or finish it (accept/rollback).".format(repo.active_session_id()))
         return 1
 
-    # 1) start an agent session (this also starts continuous autosave in the background)
+    # start an agent session (this also starts continuous autosave in the background)
     rc = cmd_start(argparse.Namespace(instruction=task, prompt_file=None, actor="agent",
                                       agent="Claude Code", model=args.model, tool="claude",
                                       tag=args.tag, no_watch=False))
     if rc:
         return rc
+    return _claude_finish(repo, task, args)
 
-    # 2) launch Claude Code with the guardrail prompt.
-    #    Default is headless auto-edit; override the whole command with CHECKPOINT_CLAUDE_CMD.
+
+def _claude_finish(repo, task, args, resuming=False) -> int:
+    import os as _os, shlex as _shlex, subprocess as _sub
+    # 1) launch Claude Code with the guardrail prompt (headless auto-edit by default).
     if not args.no_launch:
-        default_cmd = "claude -p --permission-mode acceptEdits"
-        cmd = _shlex.split(_os.environ.get("CHECKPOINT_CLAUDE_CMD", default_cmd))
-        if args.model and "--model" not in cmd:
+        cmd = _shlex.split(_os.environ.get("CHECKPOINT_CLAUDE_CMD", "claude -p --permission-mode acceptEdits"))
+        if getattr(args, "model", None) and "--model" not in cmd:
             cmd += ["--model", args.model]
         child_env = _os.environ.copy()
-        # Prefer the claude.ai login over a stale/empty ANTHROPIC_API_KEY when asked.
-        use_login = args.login or _os.environ.get("CHECKPOINT_CLAUDE_LOGIN", "").lower() in ("1", "true", "yes")
+        use_login = getattr(args, "login", False) or _os.environ.get("CHECKPOINT_CLAUDE_LOGIN", "").lower() in ("1", "true", "yes")
         if use_login:
             child_env.pop("ANTHROPIC_API_KEY", None)
+        prompt = _claude_prompt(task)
+        if resuming:
+            prompt = "Continue the in-progress task where it left off.\n\n" + prompt
         info(util.dim("\nClaude Code is working on the task…\n"))
         try:
-            _sub.run(cmd + [_claude_prompt(task)], env=child_env)
+            _sub.run(cmd + [prompt], env=child_env)
         except FileNotFoundError:
             info(util.yellow("'{}' not found on PATH. Make your changes now, then return here "
                              "and press Enter.".format(cmd[0])))
@@ -322,12 +334,12 @@ def cmd_claude(args) -> int:
             except (EOFError, KeyboardInterrupt):
                 pass
 
-    # 3) run tests (unless --no-tests), then build the review packet
+    # 2) run tests (unless --no-tests), then build the review packet
     if not args.no_tests:
         cmd_verify(argparse.Namespace())
     cmd_packet(argparse.Namespace(json=False))
 
-    # 4) review + decision — autopilot (Owner Agent) or manual
+    # 3) review + decision — autopilot (Owner Agent) or manual
     if getattr(args, "autopilot", False):
         return _autopilot_review(repo, args)
     return _claude_review(repo, args)
@@ -754,6 +766,242 @@ def _mr_review_loop(ui_base, token, base, args, d) -> int:
         if st == 200:
             d = d2
             _mr_print_screen(d)
+
+
+# ---------------------------------------------------------------------- next / first-push / web (concierge)
+
+def _personal_cfg(repo) -> dict:
+    return repo.config.data.get("personal", {}) or {}
+
+
+def _set_personal(repo, **kw) -> None:
+    p = repo.config.data.setdefault("personal", {})
+    p.update(kw)
+    repo.config.save()
+
+
+def _quiet_http_remote(repo):
+    """(ui_base, token) for the hosted remote, or None — never errors/prints."""
+    from urllib.parse import urlparse
+    remotes = remotemod.list_remotes(repo)
+    spec = None
+    for cand in ("checkpoint", "origin"):
+        if remotes.get(cand, {}).get("type") == "http":
+            spec = remotes[cand]; break
+    if not spec:
+        return None
+    try:
+        u = urlparse(spec["url"].rstrip("/"))
+        parts = [p for p in u.path.split("/") if p]
+        if len(parts) < 2:
+            return None
+        return "{}://{}/ui/repos/{}/{}".format(u.scheme, u.netloc, parts[-2], parts[-1]), spec.get("token")
+    except Exception:
+        return None
+
+
+def _open_mrs(repo):
+    r = _quiet_http_remote(repo)
+    if not r:
+        return None  # no hosted remote
+    ui_base, token = r
+    try:
+        st, rows = remotemod._http("GET", ui_base + "/reviews", token, None, None, 3.0)
+        if st != 200 or not isinstance(rows, list):
+            return None
+        return [m for m in rows if m.get("status") == "open"]
+    except Exception:
+        return None
+
+
+def _backup_state(repo):
+    spec = remotemod.list_remotes(repo).get("backup")
+    if not spec:
+        return {"configured": False, "status": "not configured"}
+    try:
+        stt = remotemod.sync_status(repo, "backup")
+        rels = [b.get("relationship", "") for b in stt.get("branches", [])]
+        if any("ahead" in r for r in rels):
+            return {"configured": True, "status": "behind"}     # local ahead of backup
+        return {"configured": True, "status": "current"}
+    except Exception:
+        return {"configured": True, "status": "not reachable"}
+
+
+def cmd_next(args) -> int:
+    as_json = getattr(args, "json", False)
+    root = Path.cwd()
+    if not (root / ".checkpoint").exists():
+        return _next_emit({
+            "initialized": False, "repo": root.name,
+            "recommended_action": "init",
+            "recommended_reason": "Checkpoint is not set up in this repo yet",
+            "suggested": ["checkpoint-core personal init"],
+        }, as_json)
+
+    repo = _repo()
+    head = repo.head_snapshot()
+    head_tree = repo.get_object(head)["tree"] if head and repo.has_object(head) else None
+    cur_tree = scan_to_tree(repo)
+    td = tree_diff(repo, head_tree, cur_tree)
+    dirty = bool(td["files"])
+
+    sess = Session.active(repo)
+    open_sessions = [s for s in repo.session_ids()
+                     if (util.read_json(repo.paths.session_dir(s) / "session.json", {}) or {}).get("status") == "active"]
+    active = None
+    if sess is not None:
+        ver = verifymod.last_verification(repo, sess)
+        active = {"id": sess.id, "instruction": sess.data.get("instruction", ""),
+                  "files_changed": td["stats"]["files_changed"],
+                  "tests": (ver.get("overall") if ver else "not run"),
+                  "last_snapshot": (sess.data.get("snapshots") or [None])[-1]}
+
+    last_accepted = None
+    if head:
+        try:
+            last_accepted = {"snapshot": head, "message": repo.get_object(head).get("message", "")}
+        except Exception:
+            pass
+
+    pcfg = _personal_cfg(repo)
+    first_push_done = bool(pcfg.get("first_push_done"))
+    first_push_needed = (not first_push_done) and head is not None
+
+    mrs = _open_mrs(repo)
+    backup = _backup_state(repo)
+    integrity = "healthy" if (head is None or repo.has_object(head)) else "warnings"
+    try:
+        signatures = "valid" if signmod.verify_all(repo).get("ok") else "issues"
+    except Exception:
+        signatures = "n/a"
+
+    # recommend (priority order)
+    if first_push_needed:
+        rec, why = "first_push", "this repo has not been pushed or backed up yet"
+    elif active is not None:
+        rec, why = "resume", "you have an open session: {}".format(active["instruction"][:50])
+    elif dirty:
+        rec, why = "create_session", "untracked/unaccepted changes but no active session"
+    elif mrs:
+        rec, why = "review", "open merge request waiting: {}".format(mrs[0]["id"])
+    elif backup["configured"] and backup["status"] == "behind":
+        rec, why = "backup", "accepted history is ahead of your backup"
+    else:
+        rec, why = "new_task", "repo is clean — start a new task"
+
+    data = {
+        "initialized": True, "repo": root.name, "branch": repo.head_branch() or "(detached)",
+        "status": "dirty" if dirty else "clean",
+        "first_push_done": first_push_done, "first_push_needed": first_push_needed,
+        "open_sessions": open_sessions, "active_session": active,
+        "dirty_no_session": dirty and active is None,
+        "open_mrs": mrs or [], "open_mrs_available": mrs is not None,
+        "last_accepted": last_accepted,
+        "verification": (active["tests"] if active else "n/a"),
+        "policy": "active" if policymod.load(repo) else "none",
+        "signatures": signatures, "backup": backup, "integrity": integrity,
+        "recommended_action": rec, "recommended_reason": why,
+    }
+    return _next_emit(data, as_json)
+
+
+def _next_emit(d, as_json) -> int:
+    if as_json:
+        print(_dump(d))
+        return 0
+    if not d.get("initialized"):
+        info(util.yellow("Checkpoint is not set up in this repo."))
+        info("  Suggested: " + util.bold("checkpoint-core personal init"))
+        return 0
+    info(util.bold("Checkpoint Summary"))
+    info("  Repo:          {}".format(d["repo"]))
+    info("  Branch:        {}".format(d["branch"]))
+    info("  Status:        {}".format(util.yellow(d["status"]) if d["status"] == "dirty" else util.green("clean")))
+    if d.get("last_accepted"):
+        info("  Last accepted: {}".format((d["last_accepted"]["message"] or "")[:50]))
+    info("  Open sessions: {}".format(len(d["open_sessions"])))
+    if d.get("open_mrs_available"):
+        info("  Open MRs:      {}".format(len(d["open_mrs"])))
+    info("  Policy:        {}".format(d["policy"]))
+    info("  Signatures:    {}".format(d["signatures"]))
+    info("  Backup:        {}".format(d["backup"]["status"]))
+    info("  Integrity:     {}".format(d["integrity"]))
+    info("")
+    if d.get("active_session"):
+        a = d["active_session"]
+        info(util.bold("You have an open session: ") + a["instruction"][:60])
+        info("  {} file(s) changed · tests: {}".format(a["files_changed"], a["tests"]))
+        info("  Suggested: " + util.green("resume with Claude") + util.dim("  (checkpoint-core claude --continue)"))
+    else:
+        info("Suggested next: " + util.green(d["recommended_action"]) + util.dim("  ({})".format(d["recommended_reason"])))
+    return 0
+
+
+def cmd_first_push(args) -> int:
+    repo = _repo()
+    if getattr(args, "status", False):
+        done = bool(_personal_cfg(repo).get("first_push_done"))
+        print(_dump({"first_push_done": done}) if getattr(args, "json", False)
+              else ("first push: done" if done else "first push: not done"))
+        return 0
+    pcfg = _personal_cfg(repo)
+    if pcfg.get("first_push_done") and not getattr(args, "force", False):
+        info("First push already completed. (Use backup run / push to sync.)")
+        return 0
+    # choose a destination
+    remotes = remotemod.list_remotes(repo)
+    dest_name, dest_label = None, None
+    for cand in ("checkpoint", "origin"):
+        if remotes.get(cand, {}).get("type") == "http":
+            dest_name = cand; dest_label = remotes[cand]["url"]; break
+    if not dest_name and remotes.get("backup"):
+        dest_name = "backup"; dest_label = remotes["backup"].get("path")
+    if not dest_name:
+        if not (getattr(args, "yes", False) or getattr(args, "dest", None)):
+            if not confirm("No remote/backup configured. Create a local backup folder?", False):
+                info("Skipped. Continuing local-only."); return 0
+        dest = args.dest or str(Path.home() / "CheckpointBackups" / Path.cwd().name)
+        _init_store_at(dest)
+        remotemod.add_remote(repo, "backup", "filesystem", dest, require_signed_snapshots=False)
+        dest_name, dest_label = "backup", dest
+    branch = repo.head_branch() or "main"
+    try:
+        res = remotemod.push(repo, dest_name, branch, tags=True)
+    except ValueError as exc:
+        err(str(exc)); return 1
+    if res.get("status") not in ("pushed", "up-to-date"):
+        err("first push failed: {}".format(res.get("status"))); return 1
+    # verify + record
+    ok = True
+    try:
+        remotemod.sync_status(repo, dest_name)
+    except Exception:
+        ok = False
+    _set_personal(repo, first_push_done=True, default_backup=dest_name if dest_name == "backup" else None,
+                  default_remote=dest_name if dest_name != "backup" else _personal_cfg(repo).get("default_remote"))
+    ledgermod.append(repo, "backup", None, {"id": "first-push"},
+                     {"action": "first_push", "remote": dest_name, "objects": res.get("objects_sent", 0)})
+    info(util.green("First push complete."))
+    info("  Remote: {}".format(dest_label))
+    info("  Synced: accepted history, sessions, signatures, public identities, policy, tags, audit")
+    info("  Not synced: private keys, autosaves")
+    info("  Backup status: " + ("current" if ok else "pushed (status check unavailable)"))
+    return 0
+
+
+def cmd_web(args) -> int:
+    urls = ["http://localhost:3000", "http://localhost:8800/"]
+    info(util.bold("Web review UI:"))
+    info("  {}   {}".format(urls[0], util.dim("(full Next.js app)")))
+    info("  {}  {}".format(urls[1], util.dim("(embedded, served by checkpoint-server)")))
+    if getattr(args, "open", False):
+        import subprocess as _sub
+        try:
+            _sub.run(["open", urls[0]])
+        except Exception:
+            pass
+    return 0
 
 
 # ---------------------------------------------------------------------- autopilot / personal / backup
@@ -3086,7 +3334,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("claude",
                         help='run a Claude Code task in a reviewed session: claude "<task>"')
-    sp.add_argument("task")
+    sp.add_argument("task", nargs="?", default="")
+    sp.add_argument("--continue", dest="cont", action="store_true",
+                    help="resume the open session instead of starting a new task")
     sp.add_argument("--model", help="model hint recorded on the session")
     sp.add_argument("--tag", action="append")
     sp.add_argument("--no-tests", action="store_true", help="skip verification after Claude finishes")
@@ -3101,6 +3351,23 @@ def build_parser() -> argparse.ArgumentParser:
                              "auto", "escalate", "rollback-on-fail"],
                     help="non-interactive decision (default: ask). auto/escalate/rollback-on-fail are autopilot modes")
     sp.set_defaults(func=cmd_claude)
+
+    # ---- concierge: next / first-push / web ----
+    spn = sub.add_parser("next", help="inspect the repo and recommend the next action (concierge)")
+    spn.add_argument("--json", action="store_true")
+    spn.set_defaults(func=cmd_next)
+
+    spf = sub.add_parser("first-push", help="set up the first personal push/backup for this repo")
+    spf.add_argument("--yes", action="store_true", help="non-interactive (skill-confirmed)")
+    spf.add_argument("--status", action="store_true", help="report whether first push is done")
+    spf.add_argument("--dest", help="destination path/remote (default: ~/CheckpointBackups/<repo>)")
+    spf.add_argument("--force", action="store_true")
+    spf.add_argument("--json", action="store_true")
+    spf.set_defaults(func=cmd_first_push)
+
+    spw = sub.add_parser("web", help="print (or open) the local web review UI URL")
+    spw.add_argument("--open", action="store_true")
+    spw.set_defaults(func=cmd_web)
 
     # ---- mr: scriptable merge-request review surface (talks to the hosted remote) ----
     mp = sub.add_parser("mr", help="merge requests: create/list/show/diff/comment/approve/merge/...")
