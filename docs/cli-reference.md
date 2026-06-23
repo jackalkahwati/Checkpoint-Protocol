@@ -13,6 +13,7 @@ Run any command with `--help` for full flags. Three entry points:
 | `claude "<task>" [--model --no-tests --no-launch --decision --tag --autopilot --json --login]` | One-verb agent run: session → autosave → launch Claude → tests → packet → one summary → accept/rollback. `--autopilot` adds Owner Agent review + auto-accept/escalate. |
 
 ### Personal autopilot (v1.2)
+`next [--json]` (concierge state) · `session list|prune` (clean superseded sessions) ·
 `personal init|status|daily` · `autopilot claude "<task>"|review [mr_N --decision approve|merge]|explain|status|config` ·
 `backup init <dir>|run|status|restore`. Owner Agent reviews AI work (sessions and MRs) and
 auto-accepts low-risk changes or escalates; reviews are persisted/ledgered/signed and

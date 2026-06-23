@@ -174,8 +174,9 @@ def _session_facts(repo: Repo, sess: Session) -> Dict[str, Any]:
     changed = [f["path"] for f in td["files"]]
     ver = verifymod.last_verification(repo, sess)
     cmds = (repo.config.data.get("verification") or {}).get("commands") or []
-    # no verification ran: vacuous pass if the repo has no test commands, else "not run"
-    tests = (ver.get("overall") if ver else None) or ("passed" if not cmds else "not run")
+    # no tests configured -> nothing to run -> the "tests passed" gate is vacuously satisfied
+    # (covers both --no-tests and a real `verify` that reports "skipped" with no commands).
+    tests = "passed" if not cmds else ((ver.get("overall") if ver else None) or "not run")
     cur = idmod.load(repo, repo.current_identity_id()) if repo.current_identity_id() else {}
     pol = policymod.load(repo)
     pol_effect, pol_reasons, pol_id = "allow", [], None

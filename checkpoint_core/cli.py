@@ -366,8 +366,8 @@ def _backup_run_if_configured(repo) -> str:
     try:
         res = remotemod.push(repo, "backup", repo.head_branch() or "main")
         return "synced" if res.get("status") in ("pushed", "up-to-date") else res.get("status", "?")
-    except Exception as exc:
-        return "failed: {}".format(exc)
+    except Exception:
+        return "not reachable"
 
 
 def _run_after_hooks(repo, cfg, which="after_accept") -> dict:
@@ -469,7 +469,8 @@ def _autopilot_finish(args, s, snapshot, hooks, escalate=False, repo=None, args2
     info("  Risk:         " + util.green(s["risk"]))
     info("  Action:       " + util.green(s["action"]))
     info("  History:      " + ("signed + sealed" if snapshot else "—"))
-    info("  Backup:       " + (hooks.get("backup", "—")))
+    bk = hooks.get("backup", "—")
+    info("  Backup:       " + bk + ("   (work accepted locally)" if bk in ("not reachable", "not configured") else ""))
     if snapshot:
         info("")
         info("  Accepted Snapshot: " + util.cyan(_short(snapshot)))
@@ -815,17 +816,19 @@ def _open_mrs(repo):
 
 
 def _backup_state(repo):
-    spec = remotemod.list_remotes(repo).get("backup")
-    if not spec:
-        return {"configured": False, "status": "not configured"}
+    """Where accepted history is replicated: a filesystem 'backup' remote, else the hosted remote."""
+    remotes = remotemod.list_remotes(repo)
+    name = "backup" if remotes.get("backup") else next(
+        (n for n in ("checkpoint", "origin") if remotes.get(n, {}).get("type") == "http"), None)
+    if not name:
+        return {"configured": False, "status": "not configured", "target": None}
     try:
-        stt = remotemod.sync_status(repo, "backup")
+        stt = remotemod.sync_status(repo, name)
         rels = [b.get("relationship", "") for b in stt.get("branches", [])]
-        if any("ahead" in r for r in rels):
-            return {"configured": True, "status": "behind"}     # local ahead of backup
-        return {"configured": True, "status": "current"}
+        status = "behind" if any("ahead" in r for r in rels) else "current"   # local ahead of remote
+        return {"configured": True, "status": status, "target": name}
     except Exception:
-        return {"configured": True, "status": "not reachable"}
+        return {"configured": True, "status": "not reachable", "target": name}
 
 
 def cmd_next(args) -> int:
@@ -847,8 +850,11 @@ def cmd_next(args) -> int:
     dirty = bool(td["files"])
 
     sess = Session.active(repo)
-    open_sessions = [s for s in repo.session_ids()
+    cur_id = sess.id if sess is not None else None
+    active_status = [s for s in repo.session_ids()
                      if (util.read_json(repo.paths.session_dir(s) / "session.json", {}) or {}).get("status") == "active"]
+    open_sessions = [cur_id] if cur_id else []
+    stale_sessions = [s for s in active_status if s != cur_id]   # superseded zombies
     active = None
     if sess is not None:
         ver = verifymod.last_verification(repo, sess)
@@ -866,10 +872,20 @@ def cmd_next(args) -> int:
 
     pcfg = _personal_cfg(repo)
     first_push_done = bool(pcfg.get("first_push_done"))
-    first_push_needed = (not first_push_done) and head is not None
+    remotes = remotemod.list_remotes(repo)
+    has_push_target = bool(remotes.get("backup")) or any(
+        remotes.get(n, {}).get("type") == "http" for n in ("checkpoint", "origin"))
+    # self-heal: a configured remote/backup means first push effectively happened (don't nag)
+    if has_push_target and head is not None and not first_push_done:
+        _set_personal(repo, first_push_done=True)
+        first_push_done = True
+    first_push_needed = (not first_push_done) and head is not None and not has_push_target
 
     mrs = _open_mrs(repo)
     backup = _backup_state(repo)
+    if backup.get("target"):
+        backup["sync_command"] = ("checkpoint-core backup run" if backup["target"] == "backup"
+                                  else "checkpoint-core push {} {}".format(backup["target"], repo.head_branch() or "main"))
     integrity = "healthy" if (head is None or repo.has_object(head)) else "warnings"
     try:
         signatures = "valid" if signmod.verify_all(repo).get("ok") else "issues"
@@ -916,6 +932,7 @@ def cmd_next(args) -> int:
         "suggested_autopilot_command": ap_cmd,
         "first_push_done": first_push_done, "first_push_needed": first_push_needed,
         "open_sessions": open_sessions, "active_session": active,
+        "stale_sessions": len(stale_sessions),
         "dirty_no_session": dirty and active is None,
         "open_mrs": mrs or [], "open_mrs_available": mrs is not None,
         "last_accepted": last_accepted,
@@ -941,12 +958,15 @@ def _next_emit(d, as_json) -> int:
     info("  Status:        {}".format(util.yellow(d["status"]) if d["status"] == "dirty" else util.green("clean")))
     if d.get("last_accepted"):
         info("  Last accepted: {}".format((d["last_accepted"]["message"] or "")[:50]))
-    info("  Open sessions: {}".format(len(d["open_sessions"])))
+    info("  Open sessions: {}".format(len(d["open_sessions"]))
+         + (util.dim("  ({} stale — checkpoint-core session prune)".format(d["stale_sessions"]))
+            if d.get("stale_sessions") else ""))
     if d.get("open_mrs_available"):
         info("  Open MRs:      {}".format(len(d["open_mrs"])))
     info("  Policy:        {}".format(d["policy"]))
     info("  Signatures:    {}".format(d["signatures"]))
-    info("  Backup:        {}".format(d["backup"]["status"]))
+    info("  Backup:        {}{}".format(d["backup"]["status"],
+         util.dim("  (-> {})".format(d["backup"]["target"])) if d["backup"].get("target") else ""))
     info("  Integrity:     {}".format(d["integrity"]))
     if d["backup"].get("status") == "not reachable":
         info("  " + util.yellow("Backup remote is unreachable — fix it or continue local-only (not broken)."))
@@ -1011,6 +1031,41 @@ def cmd_first_push(args) -> int:
     info("  Not synced: private keys, autosaves")
     info("  Backup status: " + ("current" if ok else "pushed (status check unavailable)"))
     return 0
+
+
+def cmd_session(args) -> int:
+    import checkpoint_core.session as sessionmod
+    repo = _repo()
+    sub = getattr(args, "session_cmd", None) or "list"
+    cur = repo.active_session_id()
+    active = [s for s in repo.session_ids()
+             if (util.read_json(repo.paths.session_dir(s) / "session.json", {}) or {}).get("status") == "active"]
+    if sub == "list":
+        if not active:
+            info("No open sessions."); return 0
+        for s in active:
+            d = util.read_json(repo.paths.session_dir(s) / "session.json", {}) or {}
+            tag = util.green(" (current)") if s == cur else util.yellow(" (stale)")
+            info("{}{}  {}".format(s, tag, (d.get("instruction") or "")[:50]))
+        return 0
+    if sub == "prune":
+        stale = [s for s in active if s != cur]
+        if not stale:
+            info("No stale sessions to prune."); return 0
+        if not getattr(args, "yes", False):
+            info("Stale (superseded) sessions:")
+            for s in stale:
+                info("  " + s)
+            if not confirm("Abandon {} stale session(s)? (working tree untouched)".format(len(stale)), False):
+                return 0
+        for s in stale:
+            sess = sessionmod.Session.load(repo, s)
+            sess.set_status(sessionmod.ABANDONED)
+            sess.save()
+        info(util.green("Pruned {} stale session(s).".format(len(stale))))
+        return 0
+    err("usage: checkpoint-core session <list|prune>")
+    return 2
 
 
 def cmd_web(args) -> int:
@@ -3463,6 +3518,12 @@ def build_parser() -> argparse.ArgumentParser:
     spw = sub.add_parser("web", help="print (or open) the local web review UI URL")
     spw.add_argument("--open", action="store_true")
     spw.set_defaults(func=cmd_web)
+
+    sps = sub.add_parser("session", help="list or prune open/stale sessions")
+    spssub = sps.add_subparsers(dest="session_cmd")
+    spssub.add_parser("list")
+    spsp = spssub.add_parser("prune"); spsp.add_argument("--yes", action="store_true")
+    sps.set_defaults(func=cmd_session, session_cmd=None)
 
     # ---- mr: scriptable merge-request review surface (talks to the hosted remote) ----
     mp = sub.add_parser("mr", help="merge requests: create/list/show/diff/comment/approve/merge/...")

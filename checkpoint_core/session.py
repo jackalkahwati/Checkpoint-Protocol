@@ -13,6 +13,7 @@ ACTIVE = "active"
 ACCEPTED = "accepted"
 REJECTED = "rejected"
 ROLLED_BACK = "rolled_back"
+ABANDONED = "abandoned"   # superseded/stale active session, cleaned up by `session prune`
 
 
 class Session:

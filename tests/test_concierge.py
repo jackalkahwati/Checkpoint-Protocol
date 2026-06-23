@@ -220,3 +220,27 @@ def test_next_detects_open_mr(tmp_path, monkeypatch, capsys):
         assert d["recommended_action"] == "review"
     finally:
         httpd.shutdown()
+
+
+# ---------------------------------------------------------------- live-shakedown regressions
+
+def test_next_no_first_push_nag_when_remote_configured(repo, capsys):
+    _init_base(repo)
+    from checkpoint_core import remote as remotemod
+    remotemod.add_remote(_repo(repo), "checkpoint", "http", "http://localhost:9/o/r", token="t")
+    d = nextj(capsys)                                    # remote present but first_push_done never set
+    assert d["first_push_needed"] is False              # self-healed: don't nag
+    assert d["recommended_action"] != "first_push"
+
+
+def test_session_prune_clears_stale(repo, capsys):
+    _init_base(repo)
+    (repo / "x.py").write_text("a\n")
+    run(["start", "wip", "--no-watch"])
+    r = _repo(repo)
+    r.set_active_session(None)                           # simulate a superseded (zombie) session
+    d = nextj(capsys)
+    assert d["stale_sessions"] == 1 and len(d["open_sessions"]) == 0
+    assert run(["session", "prune", "--yes"]) == 0
+    d2 = nextj(capsys)
+    assert d2["stale_sessions"] == 0

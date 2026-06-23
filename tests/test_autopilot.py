@@ -312,3 +312,26 @@ def test_autopilot_review_mr_protected_escalates(tmp_path, monkeypatch, capsys):
         assert "escalated" in (d.get("action_taken") or "")
     finally:
         httpd.shutdown()
+
+
+# ---------------------------------------------------------------- live-shakedown regressions
+
+def test_docs_auto_accepts_with_verify_running(repo):
+    # no --no-tests: verify runs, returns "skipped" (no commands) -> must still auto-accept
+    (repo / "docs" / "guide.md").write_text("intro\nverify\n")
+    before = len(_repo(repo).history())
+    assert run(["claude", "docs", "--autopilot", "--no-launch", "--decision", "auto"]) == 0
+    assert len(_repo(repo).history()) == before + 1
+    assert _active(repo) is None
+
+
+def test_autopilot_backup_unreachable_accepts_locally(repo, capsys, tmp_path):
+    run(["first-push", "--yes", "--dest", str(tmp_path / "bk")])
+    import shutil
+    shutil.rmtree(tmp_path / "bk")                       # backup vanishes mid-loop
+    (repo / "docs" / "guide.md").write_text("intro\nlocal\n")
+    capsys.readouterr()
+    run(["claude", "docs", "--autopilot", "--no-launch", "--no-tests", "--decision", "auto"])
+    out = capsys.readouterr().out
+    assert "auto-accepted" in out and "not reachable" in out and "accepted locally" in out
+    assert _repo(repo).head_snapshot()                  # history not corrupted
